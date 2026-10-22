@@ -7,3 +7,5 @@ __pycache__/
 build/
 dist/
 .opencode/
+# Ad-hoc probes written during review runs; never part of the suite.
+tests/_scratch_review/

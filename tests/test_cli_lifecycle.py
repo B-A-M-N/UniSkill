@@ -52,8 +52,12 @@ def test_diagnose_reports_earliest_stage(tmp_path, capsys):
     _s, workspace, _state = deployed(tmp_path, capsys)
     assert main(["diagnose", "cli-skill", "--workspace", str(workspace)]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["diagnosis"]["state"] in {"DIAGNOSED", "UNPROVEN"}
-    assert out["stage_states"]["installed"] == "PASS"
+    # Files are present but no runtime probe ran, so no stage FAILED: the
+    # diagnosis is CLEAN (nothing to fix) rather than a fabricated failure.
+    assert out["diagnosis"]["state"] == "CLEAN"
+    assert out["stage_states"] == {"installed": "PASS"}
+    assert all(v["state"] == "FILES_PRESENT"
+               for v in out["inspections"].values())
 
 
 def test_diagnose_detects_drift(tmp_path, capsys):
@@ -67,25 +71,68 @@ def test_diagnose_detects_drift(tmp_path, capsys):
     assert out["diagnosis"]["intervention"] == "RECONCILE_TRANSACTION"
 
 
-def test_repair_dry_run_makes_no_change(tmp_path, capsys):
+def test_repair_reports_nothing_to_do_when_clean(tmp_path, capsys):
+    """A deployed-but-unprobed skill has no FAILING stage; repair must say so
+    rather than invent a repair or error out."""
     _s, workspace, _state = deployed(tmp_path, capsys)
     assert main(["repair", "cli-skill", "--workspace", str(workspace)]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["repair_plan"]["mutates"] in {"NONE", "FILES", "POLICY"}
-    assert out["budget"]["attempts"] == 3
-    assert "Dry run" in out["note"]
+    assert out["state"] == "NO_REPAIR"
+    assert out["repair"] is None
+    assert "No failing stage" in out["reason"]
+    assert out["budget"]["attempts"] == 3  # untouched: nothing was spent
+
+
+def test_repair_drift_is_advisory_not_fake_success(tmp_path, capsys):
+    """A drifted install IS repairable, but with no handler registered the
+    engine must report ADVISORY and never claim REPAIRED."""
+    _s, workspace, _state = deployed(tmp_path, capsys)
+    (workspace / ".agents/skills/cli-skill/SKILL.md").write_text("operator edit\n")
+    assert main(["repair", "cli-skill", "--workspace", str(workspace)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["repair_plan"]["intervention"] == "RECONCILE_TRANSACTION"
+
+    assert main(["repair", "cli-skill", "--workspace", str(workspace),
+                 "--execute"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["repair"]["state"] == "NO_ACTION"
+    assert out["repair"]["trace"][0]["result"] == "ADVISORY"
+    assert all(t["result"] != "REPAIRED" for t in out["repair"]["trace"])
+    # The operator's edit is never silently reverted.
+    assert (workspace / ".agents/skills/cli-skill/SKILL.md").read_text() == "operator edit\n"
+
+
+def test_diagnose_reports_policy_blocker_over_missing_files(tmp_path, capsys):
+    """A policy-denied harness is a real blocker and must outrank a harness
+    that merely lacks probe evidence."""
+    s = sample(tmp_path)
+    workspace = tmp_path / "repo"
+    (workspace / ".crush/skills").mkdir(parents=True)
+    import shutil
+    shutil.copytree(s, workspace / ".crush/skills/cli-skill")
+    (workspace / "crushrc").write_text("option disable-skill cli-skill\n")
+    (workspace / "crush.json").write_text(json.dumps(
+        {"options": {"disabled_skills": ["cli-skill"]}}))
+    assert main(["install", str(s), "--target", "codex", "--workspace",
+                 str(workspace), "--apply"]) == 0
+    capsys.readouterr()
+    assert main(["diagnose", "cli-skill", "--workspace", str(workspace),
+                 "--target", "crush", "codex"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["stage_states"]["discovered"] == "POLICY_DENIED"
+    assert out["diagnosis"]["intervention"] == "REPORT_POLICY_BLOCKER"
+    assert out["diagnosis"]["blocked"] is True
 
 
 def test_repair_never_claims_success_without_handler(tmp_path, capsys):
     _s, workspace, _state = deployed(tmp_path, capsys)
-    assert main(["repair", "cli-skill", "--workspace", str(workspace), "--execute"]) == 0
+    (workspace / ".agents/skills/cli-skill/SKILL.md").write_text("operator edit\n")
+    assert main(["repair", "cli-skill", "--workspace", str(workspace),
+                 "--execute"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["repair"]["safety"]["invariant_tradeaway_blocked"] is True
     for effect in ("weaken_permission", "grant_credential", "skip_consent", "drop_invariant"):
         assert effect in out["repair"]["safety"]["never"]
-    # No handler exists for the diagnosed intervention, so nothing may be
-    # reported as repaired.
-    assert all(t["result"] != "REPAIRED" for t in out["repair"]["trace"])
 
 
 def test_diagnose_without_receipt_is_unverified(tmp_path, capsys):

@@ -177,21 +177,35 @@ def dispatch(args):
                                           args.workspace.resolve(),
                                           args.home.resolve(), registry)
                  for h in selected}
+        # Roll the per-harness findings up into ONE stage verdict. Files being
+        # present is a precondition for discovery, not evidence of it: a
+        # harness whose runtime was never probed stays UNVERIFIED, and only an
+        # actually-missing copy (or an explicit policy blocker) is a failure.
+        # Any harness that fails outranks the ones that merely lack evidence.
+        precedence = ("POLICY_DENIED", "TRUST_REQUIRED", "QUARANTINED",
+                      "SHADOWED", "NOT_INSTALLED", "UNVERIFIED")
+        rollup = {"installed": stage_states["installed"]}
         for h, detail in found.items():
-            stage_states["discovered"] = {
-                "FILES_PRESENT": "NOT_INSTALLED",
-                "ABSENT": "NOT_INSTALLED",
-            }.get(detail.get("state"), "UNVERIFIED")
-            if detail.get("conflict"):
-                stage_states["discovered"] = "SHADOWED"
-        for h, detail in found.items():
-            policy = " ".join(detail.get("policy_diagnostics", []))
+            policy = " ".join(detail.get("policy_diagnostics", [])).lower()
+            present = detail.get("state") == "FILES_PRESENT"
             if "disabled" in policy or "deny" in policy:
-                stage_states["discovered"] = "POLICY_DENIED"
-            elif "trust" in policy.lower():
-                stage_states["discovered"] = "TRUST_REQUIRED"
-            elif "quarantin" in policy.lower():
-                stage_states["discovered"] = "QUARANTINED"
+                verdict = "POLICY_DENIED"
+            elif "trust" in policy:
+                verdict = "TRUST_REQUIRED"
+            elif "quarantin" in policy:
+                verdict = "QUARANTINED"
+            elif detail.get("conflict"):
+                verdict = "SHADOWED"
+            elif not present:
+                verdict = "NOT_INSTALLED"
+            else:
+                verdict = "UNVERIFIED"
+            if verdict != "UNVERIFIED":
+                rollup.setdefault("discovered", verdict)
+                if precedence.index(verdict) < precedence.index(
+                        rollup.get("discovered", "UNVERIFIED")):
+                    rollup["discovered"] = verdict
+        stage_states = {**stage_states, **rollup}
         row = diagnosis.diagnose(stage_states,
                                  evidence={h: found[h] for h in found})
         report = {"skill": args.skill, "diagnosis": row,
@@ -199,8 +213,18 @@ def dispatch(args):
                   "inspections": found}
         if cmd == "diagnose":
             return report
-        plan_item = repair.plan_repair(row, allow_policy=args.allow_policy)
         budget = repair.Budget(max_attempts=args.max_attempts, max_cost=args.max_cost)
+        # A CLEAN (all proven stages passed) or UNPROVEN (no stage failed, but
+        # nothing beyond installation was proven either) diagnosis has no
+        # failing stage to repair. Say so plainly instead of erroring.
+        if row.get("state") in {"CLEAN", "UNPROVEN"}:
+            return {**report, "state": "NO_REPAIR", "repair": None,
+                    "reason": ("No failing stage to repair"
+                               if row["state"] == "CLEAN" else
+                               "No stage failed; remaining stages lack runtime "
+                               "evidence and cannot be repaired by UniSkill"),
+                    "budget": budget.remaining()}
+        plan_item = repair.plan_repair(row, allow_policy=args.allow_policy)
         if not args.execute:
             return {**report, "repair_plan": plan_item.as_dict(),
                     "budget": budget.remaining(),

@@ -341,6 +341,48 @@ def _release_ownership(state, ledger, receipt, rid):
     _write_ledger(state, ledger)
 
 
+def _receipt_chain_owner(state, dest, ledger):
+    """Authoritative owner of a destination, derived from SIGNED receipts.
+
+    The ownership ledger is only a fast index: it is a plain file that can be
+    deleted or hand-edited, so it is never allowed to be the sole authority for
+    who owns a deployment. Ownership is instead derived from the signed receipt
+    chain, which the ledger cannot forge:
+
+        owner = the active receipt for `dest` that no other active receipt
+                supersedes.
+
+    Rolled-back receipts relinquish ownership. Unsigned or tampered receipts are
+    skipped entirely because they carry no authority.
+    """
+    active, superseded = [], set()
+    for path in sorted((Path(state) / "receipts").glob("*.json")):
+        try:
+            rec = read_receipt(state, path.stem)
+        except (UniSkillError, ValueError, OSError):
+            continue  # unsigned/tampered receipts carry no authority
+        if rec.get("state") == "ROLLED_BACK":
+            continue
+        for d in rec.get("destinations", []):
+            if d.get("path") != dest:
+                continue
+            active.append(rec["receipt_id"])
+            if d.get("supersedes"):
+                superseded.add(d["supersedes"])
+    current = [rid for rid in active if rid not in superseded]
+    if len(current) == 1:
+        return current[0]
+    if not current:
+        # No signed receipt claims this destination: defer to the ledger rather
+        # than inventing an owner.
+        return _dest_owned_by(ledger, dest)
+    # Several active receipts with none superseding the others is a state no
+    # legitimate install produces. Refuse to guess which one may delete.
+    raise UniSkillError(
+        f"Ambiguous ownership for {dest}: receipts {sorted(current)} all claim "
+        "it without superseding each other; refusing destructive rollback")
+
+
 def rollback(state, rid):
     state = Path(state)
     with locked(state):
@@ -350,7 +392,7 @@ def rollback(state, rid):
         ledger = _read_ledger(state)
         for d in receipt["destinations"]:
             _validate_receipt_dest(state, rid, d)
-            owner = _dest_owned_by(ledger, d["path"])
+            owner = _receipt_chain_owner(state, d["path"], ledger)
             if owner and owner != rid:
                 raise UniSkillError(
                     f"Destination {d['path']} is owned by active receipt {owner}; "

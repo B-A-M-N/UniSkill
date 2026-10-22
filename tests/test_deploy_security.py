@@ -138,6 +138,53 @@ def test_rollback_newest_releases_ownership_to_predecessor(tmp_path):
     assert verify_receipt(read_receipt(state, r1["receipt_id"]), state)["state"] == "INSTALLED"
 
 
+def test_ownership_survives_deleted_ledger(tmp_path):
+    """REL-01 hardening: ownership is derived from the SIGNED receipt chain, so
+    deleting the mutable ownership ledger must not let a stale receipt delete
+    files that a newer active receipt owns."""
+    s = skill(tmp_path)
+    ws = tmp_path / "ws"
+    state = tmp_path / "state"
+    r1 = install(plan(s, ["codex"], "project", ws, tmp_path), state)
+    r2 = install(plan(s, ["codex"], "project", ws, tmp_path), state)
+    (state / "ownership.json").unlink()
+    with pytest.raises(UniSkillError, match="roll back the newest receipt first"):
+        rollback(state, r1["receipt_id"])
+    dest = Path(r2["destinations"][0]["path"])
+    assert dest.exists()
+    assert verify_receipt(read_receipt(state, r2["receipt_id"]), state)["state"] == "INSTALLED"
+
+
+def test_ownership_survives_hand_edited_ledger(tmp_path):
+    """REL-01 hardening: a hand-edited ledger that assigns the destination back
+    to the older receipt must not override the signed supersede chain."""
+    s = skill(tmp_path)
+    ws = tmp_path / "ws"
+    state = tmp_path / "state"
+    r1 = install(plan(s, ["codex"], "project", ws, tmp_path), state)
+    r2 = install(plan(s, ["codex"], "project", ws, tmp_path), state)
+    ledger_path = state / "ownership.json"
+    ledger = json.loads(ledger_path.read_text())
+    for entry in ledger.values():
+        entry["receipt_id"] = r1["receipt_id"]
+    ledger_path.write_text(json.dumps(ledger))
+    with pytest.raises(UniSkillError, match="roll back the newest receipt first"):
+        rollback(state, r1["receipt_id"])
+    assert Path(r2["destinations"][0]["path"]).exists()
+
+
+def test_rollback_of_lone_receipt_still_works_without_ledger(tmp_path):
+    """The tamper defense must not break the normal case: with a single active
+    receipt, deleting the ledger is harmless and rollback still succeeds."""
+    s = skill(tmp_path)
+    ws = tmp_path / "ws"
+    state = tmp_path / "state"
+    r1 = install(plan(s, ["codex"], "project", ws, tmp_path), state)
+    (state / "ownership.json").unlink()
+    assert rollback(state, r1["receipt_id"])["state"] == "ROLLED_BACK"
+    assert not Path(r1["destinations"][0]["path"]).exists()
+
+
 def test_post_install_digest_mismatch_reported_failed(tmp_path, monkeypatch):
     """No-false-success: if a destination no longer holds the source digest after
     publishing, install() must FAIL (raise) rather than mint an INSTALLED receipt,

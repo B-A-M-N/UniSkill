@@ -129,18 +129,48 @@ UniSkill supports a **trusted, explicitly configured** external runner protocol.
 {"response":"Audit complete", "tool_calls":[{"name":"search"}]}
 ```
 
-Create `cases.jsonl` with `prompt`, optional `must_include`, `must_not_include`, `required_tools`, `forbidden_tools`, and optional `expected_exit_code`. See `evals/example.jsonl` and `examples/runner.json`. Run:
+### Four test types
+
+Every case carries a `type` field:
+
+| Type | Question | Negative form |
+|---|---|---|
+| `discovery` | Did the runtime identify the correct skill? | `must_not_match_skill` — the skill must NOT surface for that prompt |
+| `invocation` | Did the runtime **explicitly** invoke the skill? | `must_not_invoke_skill` |
+| `selection` | Did the runtime **automatically** select it? | `must_not_select_skill` |
+| `functionality` | Did it produce the required artifacts and behavior, with no forbidden side effects? | `forbidden_artifacts`, `allowed_diff_prefix` |
+| `regression` | Does the current run preserve previously established behavior? | compared against a stored baseline |
+
+A case with no `type` defaults to `functionality`, and the original assertion keys (`must_include`, `must_not_include`, `required_tools`, `forbidden_tools`, `expected_exit_code`) keep working. See the typed examples in `evals/discovery-cases.jsonl`, `evals/invocation-cases.jsonl`, `evals/selection-cases.jsonl`, `evals/functionality-cases.jsonl`, plus `evals/example.jsonl` and `examples/runner.json`.
+
+### Measured evidence vs runner-asserted evidence
+
+A runner's self-report is not proof. Where possible the evaluator **measures** instead of trusting:
+
+- **Workspace snapshot diff**: the evaluator snapshots the workspace tree (path → digest) before the run and diffs it after. `required_artifacts` are checked against the actual diff — a runner whose prose claims success but whose diff shows no artifact is **FAILED** by measured evidence. `forbidden_artifacts` and `allowed_diff_prefix` catch side effects the runner never mentions.
+- **Exit code and timeout**: OS-level; a timeout is its own state, not a generic failure.
+- **Runner-claimed `tool_calls` and `response` text** remain allowed but are labeled `evidence_type: "runner-asserted"` and can never alone prove a functionality case. A case whose only assertions are runner-asserted ones is visibly marked in the aggregate report (`verification_class: "runner-asserted-only"`).
+
+Where no harness-native probe exists (e.g. discovery for most harnesses), the evaluator returns `UNVERIFIED` for that case, not `FAILED` — the harness lacking a probe is not the skill failing.
+
+### Reliability across repetitions
+
+One successful response is not proof. Per-case reliability is computed over `--repetitions` trials: pass rate, a Wilson 95% confidence interval, and an honest verdict. Fewer than 5 trials is reported as `TOO_FEW` ("preliminary, not certified"). A case that passes in some trials and fails in others is reported **flaky/UNRELIABLE** — its own finding, distinct from a plain failure.
+
+### Regression baselines
+
+`baselines_save` / `baseline_load` (JSON, e.g. `evals/baselines/<skill>.json`) store previously-passing results. A `regression`-type case that passed in the baseline and fails now is reported as **REGRESSION** — distinct from a plain `FAILED` — because a regression is the trigger for "reject candidate or roll back", not for another optimization round.
 
 ```bash
-uniskill evaluate evals/example.jsonl \
-  --runner-config examples/runner.json --repetitions 2 --execute
+uniskill evaluate evals/functionality-cases.jsonl \
+  --runner-config examples/runner.json --repetitions 3 --execute
 ```
 
-The included `echo_runner.py` is a fixture, **not** a real agent execution backend. Its passing assertions prove that the evaluation machinery works, not that a particular skill works. Execution can run arbitrary trusted local binaries, so it must be requested with `--execute`; do not point it at untrusted scripts.
+The included `echo_runner.py` is a fixture, **not** a real agent execution backend. Its passing assertions prove that the evaluation machinery works, not that a particular skill works. Execution can run arbitrary trusted local binaries, so it must be requested with `--execute`; do not point it at untrusted scripts. The evaluator only ever launches the explicitly configured runner — it never executes anything implicitly.
 
 ## What is built and what remains
 
-**Implemented:** canonical contract validation/scaffolding; portable static validation; rejection of symlinked skill payloads; digest-based deployment; preflight shared-root planning; safe relative custom adapter registry; existing duplicate/shadow detection; multiple harness roots; explicit apply/replace gates; receipt and backup storage; protected rollback; Gemini CLI discovery-text probe; jcode/Crush discovery-root adapters; OpenCode/Crush configuration diagnostics; basic external evaluation runners; pytest suite and GitHub Actions CI.
+**Implemented:** canonical contract validation/scaffolding; portable static validation; rejection of symlinked skill payloads; digest-based deployment; preflight shared-root planning; safe relative custom adapter registry; existing duplicate/shadow detection; multiple harness roots; explicit apply/replace gates; receipt and backup storage; protected rollback; Gemini CLI discovery-text probe; jcode/Crush discovery-root adapters; OpenCode/Crush configuration diagnostics; behavioral evaluation with four test types, measured workspace-diff evidence, reliability across repetitions and regression baselines; layered status/diagnose/repair with bounded budgets; pytest suite and GitHub Actions CI.
 
 **Not implemented/proven:** LLM-driven synthesis/iterative candidate optimizer; executing real Codex/Claude/jcode/Crush/etc. sessions from within UniSkill; universal auto-trigger measurement; semantic grading of agent behavior; platform-wide sandbox guarantees; automated source provenance updates; live compatibility certification across harness/model versions; Windows filesystem installations. The lack of these capabilities must remain visible in the CLI, rather than substituting a green status for a guess.
 

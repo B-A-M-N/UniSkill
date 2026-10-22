@@ -52,10 +52,15 @@ def test_diagnose_reports_earliest_stage(tmp_path, capsys):
     _s, workspace, _state = deployed(tmp_path, capsys)
     assert main(["diagnose", "cli-skill", "--workspace", str(workspace)]) == 0
     out = json.loads(capsys.readouterr().out)
-    # Files are present but no runtime probe ran, so no stage FAILED: the
-    # diagnosis is CLEAN (nothing to fix) rather than a fabricated failure.
-    assert out["diagnosis"]["state"] == "CLEAN"
-    assert out["stage_states"] == {"installed": "PASS"}
+    # Files are present but no runtime probe ran. No stage FAILED, but the
+    # discovered stage is UNVERIFIED — an unproven lifecycle is not a clean
+    # one, so diagnose must agree with status rather than report CLEAN.
+    assert out["diagnosis"]["state"] == "DIAGNOSED"
+    assert out["diagnosis"]["intervention"] == "DECLARE_UNVERIFIABLE"
+    assert out["diagnosis"]["blocked"] is True
+    assert out["diagnosis"]["stage"] == "discovered"
+    assert out["stage_states"] == {"discovered": "UNVERIFIED",
+                                   "installed": "PASS"}
     assert all(v["state"] == "FILES_PRESENT"
                for v in out["inspections"].values())
 
@@ -72,20 +77,24 @@ def test_diagnose_detects_drift(tmp_path, capsys):
 
 
 def test_repair_reports_nothing_to_do_when_clean(tmp_path, capsys):
-    """A deployed-but-unprobed skill has no FAILING stage; repair must say so
-    rather than invent a repair or error out."""
+    """A deployed-but-unprobed skill has no FAILING stage. Repair must not
+    invent a repair, must not spend budget, and must say WHY it cannot act:
+    discovery is UNVERIFIED (no native probe), which is declared, not fixed."""
     _s, workspace, _state = deployed(tmp_path, capsys)
     assert main(["repair", "cli-skill", "--workspace", str(workspace)]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["state"] == "NO_REPAIR"
-    assert out["repair"] is None
-    assert "No failing stage" in out["reason"]
-    assert out["budget"]["attempts"] == 3  # untouched: nothing was spent
+    assert out["repair_plan"]["intervention"] == "DECLARE_UNVERIFIABLE"
+    assert out["repair_plan"]["handler"] == "none"
+    assert out["repair_plan"]["blocked"] is True
+    assert "Dry run" in out["note"]
+    # Budget untouched: declaring unverifiability is not a repair attempt.
+    assert out["budget"]["attempts"] == 3
 
 
-def test_repair_drift_is_advisory_not_fake_success(tmp_path, capsys):
-    """A drifted install IS repairable, but with no handler registered the
-    engine must report ADVISORY and never claim REPAIRED."""
+def test_repair_drift_is_not_overwritten_and_reports_failed(tmp_path, capsys):
+    """Finding 3: a drifted install is detected and its reconcile handler
+    deliberately FAILS — naming the drifted path — and never overwrites the
+    operator's edits. It must report FAILED (not ADVISORY/no-op silently)."""
     _s, workspace, _state = deployed(tmp_path, capsys)
     (workspace / ".agents/skills/cli-skill/SKILL.md").write_text("operator edit\n")
     assert main(["repair", "cli-skill", "--workspace", str(workspace)]) == 0
@@ -95,8 +104,9 @@ def test_repair_drift_is_advisory_not_fake_success(tmp_path, capsys):
     assert main(["repair", "cli-skill", "--workspace", str(workspace),
                  "--execute"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["repair"]["state"] == "NO_ACTION"
-    assert out["repair"]["trace"][0]["result"] == "ADVISORY"
+    assert out["repair"]["state"] == "STOPPED"
+    assert out["repair"]["trace"][0]["result"] == "FAILED"
+    assert "refusing to overwrite" in str(out["repair"]["trace"][0]["detail"]).lower()
     assert all(t["result"] != "REPAIRED" for t in out["repair"]["trace"])
     # The operator's edit is never silently reverted.
     assert (workspace / ".agents/skills/cli-skill/SKILL.md").read_text() == "operator edit\n"

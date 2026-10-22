@@ -16,7 +16,7 @@ import math
 import re
 import subprocess
 from pathlib import Path
-from .common import UniSkillError, digest_tree, safe_tree, read_json
+from .common import UniSkillError, safe_tree, read_json
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -265,7 +265,7 @@ def _eval_discovery(case, runner_output, workspace_diff,
     """Evaluate a *discovery* case.
 
     *measured_problems* is a list that will be extended with per-type problems.
-    Returns (state, evidence_type, evidence_detail).
+    Returns (state, problems, evidence_type, evidence_detail).
     """
     problems = list(measured_problems) if measured_problems else []
     evidence_type = RUNNER_ASSERTED
@@ -306,7 +306,7 @@ def _eval_invocation(case, runner_output, tool_calls, workspace_diff,
                      measured_problems):
     """Evaluate an *invocation* (explicit invocation) case.
 
-    Returns (state, evidence_type, evidence_detail).
+    Returns (state, problems, evidence_type, evidence_detail).
     """
     problems = list(measured_problems) if measured_problems else []
     evidence_type = RUNNER_ASSERTED
@@ -345,7 +345,7 @@ def _eval_selection(case, runner_output, tool_calls, workspace_diff,
                     measured_problems):
     """Evaluate a *selection* (automatic/auto-trigger) case.
 
-    Returns (state, evidence_type, evidence_detail).
+    Returns (state, problems, evidence_type, evidence_detail).
     """
     problems = list(measured_problems) if measured_problems else []
     evidence_type = RUNNER_ASSERTED
@@ -430,7 +430,7 @@ def _eval_functionality(case, runner_output, tool_calls, workspace_diff,
     Uses measured workspace diff + runner output assertions.
     Workspace diff is the primary evidence — not runner prose.
 
-    Returns (state, evidence_type, evidence_detail).
+    Returns (state, problems, evidence_type, evidence_detail).
     """
     problems = list(measured_problems) if measured_problems else []
 
@@ -495,11 +495,9 @@ def _eval_functionality(case, runner_output, tool_calls, workspace_diff,
                 if change_path.startswith(fpath_str):
                     problems.append(f"Forbidden artifact created/changed: {change_path}")
                     break
-                # Also check the workspace-absolute resolution of the diff path
-                abs_change = fpath_str + change_path
-                if abs_change == change_path:
-                    continue  # already checked relative path above
-                if abs_change.startswith(fpath_str):
+                # Resolve the diff path against the measured tree for absolute-prefix matching
+                resolved = str((measured_tree / change_path).resolve())
+                if resolved.startswith(fpath_str):
                     problems.append(f"Forbidden artifact created/changed (absolute match): {change_path}")
                     break
         elif isinstance(fpath_str, dict):
@@ -537,25 +535,27 @@ def _eval_functionality(case, runner_output, tool_calls, workspace_diff,
             ]
 
     # 6. Exit code check — measured evidence
-    # actual_exit_code is threaded from _run_single_case (not from case dict)
+    # actual_exit_code is threaded from _run_single_case (not from case dict).
+    # De-duplicate: _run_single_case already added "Unexpected exit code: N"
+    # when the code didn't match expected_exit_code; skip a duplicate.
+    # Skip entirely when the runner never launched (actual_exit_code None):
+    # an exit-code mismatch for a run that did not happen is noise next to
+    # the real launch failure.
     expected_exit = case.get("expected_exit_code")
-    if expected_exit is not None and actual_exit_code != expected_exit:
-        problems.append(
-            f"Unexpected exit code: {actual_exit_code} "
-            f"(expected {expected_exit})"
-        )
+    if (expected_exit is not None and actual_exit_code is not None
+            and actual_exit_code != expected_exit):
+        if not any("Unexpected exit code" in p for p in problems):
+            problems.append(
+                f"Unexpected exit code: {actual_exit_code} "
+                f"(expected {expected_exit})"
+            )
 
-    # Determine evidence type: if measured_tree was available and snapshot
-    # didn't fail, we have measured evidence (even if diff has no changes).
-    # If measured_tree is None, we have no measurement.
     has_measured_diff = bool(
         workspace_diff.get("created") or workspace_diff.get("modified")
         or workspace_diff.get("deleted")
     )
-    if measured_tree is not None:
-        evidence_type = MEASURED
-    else:
-        evidence_type = MEASURED  # snapshot was taken, diff is empty but measured
+
+    evidence_type = MEASURED
 
     evidence_detail = {
         "workspace_diff": workspace_diff,
@@ -570,11 +570,8 @@ def _eval_regression(case, runner_output, tool_calls, workspace_diff,
                      baseline_results, case_id, measured_problems):
     """Evaluate a *regression* case by comparing against a stored baseline.
 
-    Returns (state, evidence_type, evidence_detail).
+    Returns (state, problems, evidence_type, evidence_detail).
     """
-    # Start with measured problems (exit code, etc.) from subprocess
-    problems = list(measured_problems) if measured_problems else []
-
     # Find baseline for this case
     baseline_key = case.get("baseline_key", case_id)
     baseline = baseline_results.get(baseline_key)
@@ -613,9 +610,12 @@ def _eval_regression(case, runner_output, tool_calls, workspace_diff,
             current_problems += [
                 f"Forbidden tool used: {t}" for t in forb_tools if t in actual
             ]
-    # Exit code check — measured
+    # Exit code check — measured. Skip when the runner never launched
+    # (actual_exit_code None): reporting an exit-code mismatch for a run
+    # that did not happen is noise next to the real launch failure.
     current_exit_expected = case.get("expected_exit_code")
-    if current_exit_expected is not None and actual_exit_code != current_exit_expected:
+    if (current_exit_expected is not None and actual_exit_code is not None
+            and actual_exit_code != current_exit_expected):
         current_problems.append(
             f"Unexpected exit code: {actual_exit_code} (expected {current_exit_expected})"
         )
@@ -835,7 +835,6 @@ def run_behavioral_suite(cases, runner_path, repetitions=1, workspace=None,
 
     for case in cases:
         case_id = case.get("id", case["prompt"][:40])
-        case_type = case.get("type", "functionality")
 
         for repeat in range(repetitions):
             row = _run_single_case(case, case_id, runner, measured_tree, timeout,
@@ -958,6 +957,11 @@ def _run_single_case(case, case_id, runner, measured_tree, timeout,
         runner_output = ""
         actual_exit_code = None
         problems.append("Runner timed out")
+    except OSError as exc:
+        # Per-case FAILED so partial results survive (e.g. missing binary)
+        runner_output = ""
+        actual_exit_code = None
+        problems.append(f"Runner failed: {type(exc).__name__}: {exc}")
 
     # Snapshot workspace after — SAME measured tree, NOT runner.get("cwd")
     workspace_after = None

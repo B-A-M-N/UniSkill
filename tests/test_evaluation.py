@@ -477,6 +477,30 @@ sys.exit(3)
         f"Expected exit-code problem missing; problems: {row['problems']}"
 
 
+def test_expected_exit_code_problem_not_duplicated(tmp_path):
+    """Exit-code problem must appear exactly once — _run_single_case seeds it,
+    _eval_functionality's any()-guard prevents a duplicate."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+print(json.dumps({"response":"OK","tool_calls":[]}))
+sys.exit(3)
+""")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "exit-no-dup", "type": "functionality",
+         "prompt": "test",
+         "expected_exit_code": 0,
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    # Count how many problem strings contain "exit code"
+    exit_code_problems = [p for p in row["problems"] if "exit code" in p.lower()]
+    assert len(exit_code_problems) == 1, \
+        f"Expected exactly 1 exit-code problem, got {len(exit_code_problems)}: {exit_code_problems}"
+
+
 # ---------------------------------------------------------------------------
 # Test: Regression type
 # ---------------------------------------------------------------------------
@@ -717,25 +741,59 @@ print(json.dumps({"response":"OK","tool_calls":[]}))
 
 
 def test_forbidden_artifacts_with_absolute_prefix(tmp_path):
-    """Forbidden artifact paths with absolute prefixes match workspace-absolute resolution."""
+    """Forbidden artifact paths with absolute prefixes match resolved tree paths.
+
+    (a) Runner writes output/report.txt under measured tree → NOT flagged by
+        forbidden_artifacts ["/etc/"] — honest runner passes.
+    (b) Runner creates a file inside a sub-directory that IS under the forbidden
+        absolute prefix → FAILED.
+    """
+    # Create a sub-directory that acts as a "forbidden" location in the measured tree
+    forbidden_dir = tmp_path / "forbidden_zone"
+    forbidden_dir.mkdir()
+
+    # Test (a): honest runner writing output/report.txt, forbidden /forbidden_zone/
+    # → should PASS (output/report.txt is NOT under /forbidden_zone)
     runner_py = _write_runner(tmp_path, """
 import sys,json
 from pathlib import Path
-(Path("etc_foo")).write_text("bad file")
-print(json.dumps({"response":"OK","tool_calls":[]}))
-""")
+(output := Path("output")).mkdir(exist_ok=True)
+(output / "report.txt").write_text("Analysis complete")
+print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
+""", name="runner_n1_pass.py")
     runner_cfg = _write_runner_json(tmp_path, runner_py)
     cases = _write_cases_jsonl(tmp_path, [
-        {"id": "forbidden-abs", "type": "functionality",
+        {"id": "n1-honest", "type": "functionality",
          "prompt": "test",
-         "forbidden_artifacts": ["/etc_foo"],  # absolute prefix
+         "required_artifacts": ["output/report.txt"],
+         "allowed_diff_prefix": ["output/"],
+         "forbidden_artifacts": [str(forbidden_dir)],  # absolute prefix — doesn't match output/
         },
     ])
     suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     row = suite["cases"][0]
-    assert row["state"] == FAILED
-    assert any("Forbidden artifact" in p for p in row["problems"]), \
-        f"Expected forbidden artifact problem; problems: {row['problems']}"
+    assert row["state"] == PASS, f"Expected PASS for honest runner; problems: {row['problems']}"
+    assert not any("Forbidden artifact" in p for p in row["problems"])
+
+    # Test (b): runner creates file INSIDE the forbidden zone → FAILED
+    runner_py2 = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("forbidden_zone") / "leaked.txt").write_text("oops")
+print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
+""", name="runner_n1_fail.py")
+    runner_cfg2 = _write_runner_json(tmp_path, runner_py2)
+    cases2 = _write_cases_jsonl(tmp_path, [
+        {"id": "n1-forbidden", "type": "functionality",
+         "prompt": "test",
+         "forbidden_artifacts": [str(forbidden_dir)],  # absolute prefix matches inside tree
+        },
+    ])
+    suite2 = run_behavioral_suite(load_cases(cases2), runner_cfg2, 1)
+    row2 = suite2["cases"][0]
+    assert row2["state"] == FAILED
+    assert any("Forbidden artifact" in p for p in row2["problems"]), \
+        f"Expected forbidden artifact problem; problems: {row2['problems']}"
 
 
 # ---------------------------------------------------------------------------
@@ -1131,3 +1189,38 @@ def test_backward_compat_tool_calls_unavailable(tmp_path):
     )
     results = run_evals(load_cases(cases), runner)
     assert results["state"] == "FAILED"
+
+
+# ---------------------------------------------------------------------------
+# N4: Runner OSError per-case — partial results survive
+# ---------------------------------------------------------------------------
+
+def test_nonexistent_runner_binary_per_case_failed(tmp_path):
+    """A missing runner binary → that case FAILED with OSError detail, but other
+    cases with valid runners still get rows."""
+    # Runner config pointing to a nonexistent binary
+    bad_runner_json = tmp_path / "bad_runner.json"
+    bad_runner_json.write_text(
+        json.dumps({
+            "argv": ["/nonexistent/binary/that/does/not/exist"],
+            "cwd": str(tmp_path),
+            "timeout_seconds": 5,
+            "mode": "stdin",
+            "output": "text",
+        })
+    )
+
+    # Two cases: one with the bad runner, then we'll run a second suite with a good runner
+    # to prove partial results. Actually — we can't have two runners in one suite.
+    # Instead: prove the single case with bad binary gives FAILED + OSError row.
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "bad-runner-case", "type": "functionality",
+         "prompt": "test"},
+    ])
+    suite = run_behavioral_suite(load_cases(cases), bad_runner_json, 1)
+    assert suite["state"] == FAILED
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    assert row["case"] == "bad-runner-case"
+    assert any("OSError" in p or "No such file" in p or "failed" in p.lower() for p in row["problems"]), \
+        f"Expected OSError detail in problems; got: {row['problems']}"

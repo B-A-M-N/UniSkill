@@ -43,3 +43,15 @@ principles:
     class: general-best-practice
     rule: Never repair missing permissions by silently weakening policy, granting credentials, or skipping consent.
     sources: [gemini-skills, opencode-skills]
+  - id: needs-deterministic-enforcement
+    class: conditional-technique
+    rule: When a contract contains invariants or required deterministic steps, include a deterministic check/verification step in the generated skill.
+    sources: [anthropic-best-practices, vscode-customization]
+  - id: needs-negative-triggers
+    class: conditional-technique
+    rule: When a contract defines negative triggers, the generated skill must surface near-miss rejection patterns that steer the harness away from invoking the skill for unrelated requests.
+    sources: [anthropic-best-practices]
+  - id: needs-progressive-disclosure
+    class: standard-requirement
+    rule: When a skill carries references or supporting resources, main SKILL.md should reference them rather than embedding them.
+    sources: [anthropic-best-practices, agent-skills-standard]

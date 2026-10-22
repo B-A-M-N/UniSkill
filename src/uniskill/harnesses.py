@@ -28,6 +28,12 @@ class Harness:
     source: str
     tier: str = "documented"  # local-source, documented, community-mapped, custom, legacy
     native_probe: str | None = None
+    # Honest capability classification. INSTALL_ONLY means "we only know where
+    # files can be copied". It must never be presented as functional verification.
+    # DISCOVERY_PROBED: a bounded native probe exists. NATIVE_DOCUMENTED: vendor
+    # documents a native mechanism we do not execute. FUNCTIONAL_VERIFIED: only
+    # after a real functional probe (no current harness qualifies).
+    support_class: str = "INSTALL_ONLY"
 
 # The six core entries and Crush use vendor documentation. jcode was inspected
 # directly in its Rust skill loader; community mappings below are not asserted
@@ -87,6 +93,20 @@ for name, (binary, project_root, user_root) in EXTRA_MAPPINGS.items():
     HARNESSES[name] = Harness(binary, (project_root,), (user_root,), COMMUNITY_SOURCE,
                              tier="legacy" if name == "roo" else "community-mapped")
 
+# Vendor-documented root corrections (additions to the community mappings;
+# adapters.py layers session/trust semantics on top of these).
+# Kimi Code CLI also reads project-local .kimi-code/skills and user skills
+# under $KIMI_CODE_HOME/skills (default ~/.kimi-code).
+# Pi natively reads .pi/skills (project) and .pi/agent/skills (global).
+for _name, _proj, _user in (
+    ("kimi-code-cli", (".agents/skills", ".kimi-code/skills"),
+     (".agents/skills", ".kimi-code/skills")),
+    ("pi", (".agents/skills", ".pi/skills"), (".agents/skills", ".pi/agent/skills")),
+):
+    _h = HARNESSES[_name]
+    HARNESSES[_name] = Harness(_h.executable, _proj, _user, _h.source,
+                               tier=_h.tier, native_probe=_h.native_probe)
+
 
 def _validate_root(root: str) -> None:
     """Reject paths able to escape the selected workspace/home prefix."""
@@ -132,7 +152,8 @@ def load_registry(path: Path | None = None) -> dict[str, Harness]:
         if not project and not user:
             raise UniSkillError(f"Custom harness {name} needs project_roots or user_roots")
         registry[name] = Harness(executable, tuple(project), tuple(user),
-                                 obj.get("source", str(path)), tier="custom")
+                                 obj.get("source", str(path)), tier="custom",
+                                 support_class="INSTALL_ONLY")
     return registry
 
 
@@ -223,6 +244,7 @@ def choose_roots(targets, scope, workspace, home, registry=None):
 def capability_profile(name, registry=None):
     h = (registry or HARNESSES)[name]
     return {"harness":name, "tier":h.tier, "source":h.source,
+            "support_class": h.support_class,
             "project_roots":list(h.project), "user_roots":list(h.user),
             "file_discovery":"MAPPED_NOT_VERIFIED" if h.tier in {"custom","legacy","community-mapped"}
                              else "SOURCE_DOCUMENTED",

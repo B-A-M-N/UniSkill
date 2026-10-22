@@ -12,6 +12,7 @@ from .evaluation import load_cases, run_evals
 from .harnesses import (HARNESSES, capability_profile, detect, load_registry,
                         native_discovery, opencode_diagnostics, crush_diagnostics, inspect_harness_skill)
 from .validator import validate_skill
+from . import diagnosis, repair, status
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="uniskill", description="Portable skill engineering CLI")
@@ -61,6 +62,28 @@ def build_parser():
     evaluation.add_argument("--repetitions", type=int, default=1)
     capabilities = commands.add_parser("capabilities")
     capabilities.add_argument("harness")
+    diagnose = commands.add_parser("diagnose",
+        help="Earliest-failing-stage diagnosis for a deployed skill")
+    diagnose.add_argument("skill")
+    diagnose.add_argument("--scope", choices=("project", "user"), default="project")
+    diagnose.add_argument("--workspace", type=Path, default=Path.cwd())
+    diagnose.add_argument("--home", type=Path, default=Path.home())
+    diagnose.add_argument("--state-root", type=Path)
+    diagnose.add_argument("--target", nargs="+", help="Restrict diagnosis to these harnesses")
+    repair_cmd = commands.add_parser("repair",
+        help="Plan a bounded repair for the earliest diagnosed failure")
+    repair_cmd.add_argument("skill")
+    repair_cmd.add_argument("--scope", choices=("project", "user"), default="project")
+    repair_cmd.add_argument("--workspace", type=Path, default=Path.cwd())
+    repair_cmd.add_argument("--home", type=Path, default=Path.home())
+    repair_cmd.add_argument("--state-root", type=Path)
+    repair_cmd.add_argument("--target", nargs="+", help="Restrict repair to these harnesses")
+    repair_cmd.add_argument("--max-attempts", type=int, default=repair.DEFAULT_MAX_ATTEMPTS)
+    repair_cmd.add_argument("--max-cost", type=int, default=repair.DEFAULT_MAX_COST)
+    repair_cmd.add_argument("--allow-policy", action="store_true",
+        help="Approve repairs that touch harness-side policy (never weakens permissions)")
+    repair_cmd.add_argument("--execute", action="store_true",
+        help="Required to run repairs; without it only the plan is reported")
     return parser
 
 def dispatch(args):
@@ -116,25 +139,74 @@ def dispatch(args):
         if not receipt:
             return {"skill":args.skill, "state":"UNVERIFIED", "reason":"No active UniSkill deployment receipt"}
         verified = verify_receipt(receipt)
-        result = {"skill":args.skill, "receipt_id":receipt["receipt_id"],
-                  "deployment":verified, "targets":{}}
+        targets, evidence = {}, {}
         for h in receipt["targets"]:
-            target = {"installation":verified["state"], "discovery":"UNVERIFIED",
-                      "explicit_invocation":"UNVERIFIED", "automatic_selection":"UNVERIFIED",
-                      "functional":"UNVERIFIED"}
+            targets[h] = {}
+            evidence[h] = {}
             if cmd == "verify" and args.probe and verified["state"] == "INSTALLED":
-                target["discovery_evidence"] = native_discovery(h, args.skill, args.workspace.resolve())
-                target["discovery"] = target["discovery_evidence"]["state"]
-            if cmd == "doctor" and h in ("opencode", "crush"):
-                inspect = opencode_diagnostics if h == "opencode" else crush_diagnostics
-                target["policy_diagnostics"] = inspect(
-                    args.skill, args.workspace.resolve(), args.home.resolve())
-                if target["policy_diagnostics"]:
-                    target["diagnosis"] = "REVIEW_POLICY; never auto-weaken permissions"
-            result["targets"][h] = target
-        result["state"] = "INSTALLED" if verified["state"] == "INSTALLED" else "FAILED"
-        result["note"] = "Filesystem proof is not native invocation/functional proof"
+                probe = native_discovery(h, args.skill, args.workspace.resolve())
+                evidence[h]["discovered"] = probe
+                targets[h]["discovery_evidence"] = probe
+            if cmd == "doctor":
+                findings = inspect_harness_skill(
+                    args.skill, h, args.scope, args.workspace.resolve(),
+                    args.home.resolve(), registry)
+                targets[h] = findings
+                evidence[h]["installed"] = {
+                    "state": "PASS" if findings.get("state") == "FILES_PRESENT" else "NOT_INSTALLED"}
+                for policy_note in findings.get("policy_diagnostics", []):
+                    evidence[h].setdefault("policy", []).append(policy_note)
+        result = status.assemble(receipt=receipt, verify=verified,
+                                 targets=targets, evidence=evidence)
+        result["skill"] = args.skill
         return result
+    if cmd in {"diagnose", "repair"}:
+        state = state_root(args.scope, args.workspace.resolve(), args.home.resolve(), args.state_root)
+        receipt = latest_receipt(state, args.skill)
+        if not receipt:
+            return {"skill": args.skill, "state": "UNVERIFIED",
+                    "reason": "No active UniSkill deployment receipt"}
+        verified = verify_receipt(receipt)
+        selected = [h for h in (args.target or receipt["targets"]) if h in registry]
+        unknown = [h for h in (args.target or []) if h not in registry]
+        if unknown:
+            raise UniSkillError("Unknown target(s): " + ", ".join(sorted(unknown)))
+        stage_states = {
+            "installed": "PASS" if verified["state"] == "INSTALLED" else "DRIFTED"}
+        found = {h: inspect_harness_skill(args.skill, h, args.scope,
+                                          args.workspace.resolve(),
+                                          args.home.resolve(), registry)
+                 for h in selected}
+        for h, detail in found.items():
+            stage_states["discovered"] = {
+                "FILES_PRESENT": "NOT_INSTALLED",
+                "ABSENT": "NOT_INSTALLED",
+            }.get(detail.get("state"), "UNVERIFIED")
+            if detail.get("conflict"):
+                stage_states["discovered"] = "SHADOWED"
+        for h, detail in found.items():
+            policy = " ".join(detail.get("policy_diagnostics", []))
+            if "disabled" in policy or "deny" in policy:
+                stage_states["discovered"] = "POLICY_DENIED"
+            elif "trust" in policy.lower():
+                stage_states["discovered"] = "TRUST_REQUIRED"
+            elif "quarantin" in policy.lower():
+                stage_states["discovered"] = "QUARANTINED"
+        row = diagnosis.diagnose(stage_states,
+                                 evidence={h: found[h] for h in found})
+        report = {"skill": args.skill, "diagnosis": row,
+                  "stage_states": stage_states,
+                  "inspections": found}
+        if cmd == "diagnose":
+            return report
+        plan_item = repair.plan_repair(row, allow_policy=args.allow_policy)
+        budget = repair.Budget(max_attempts=args.max_attempts, max_cost=args.max_cost)
+        if not args.execute:
+            return {**report, "repair_plan": plan_item.as_dict(),
+                    "budget": budget.remaining(),
+                    "note": "Dry run. Pass repair --execute to apply."}
+        outcome = repair.run(budget, [plan_item], {}, allow_policy=args.allow_policy)
+        return {**report, "repair": outcome}
     if cmd == "evaluate":
         cases = load_cases(args.cases)
         if not args.execute:

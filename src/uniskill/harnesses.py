@@ -243,8 +243,15 @@ def choose_roots(targets, scope, workspace, home, registry=None):
 
 def capability_profile(name, registry=None):
     h = (registry or HARNESSES)[name]
+    # The authoritative support classification lives in adapters.py
+    # (SUPPORT_CLASS_OVERRIDES + custom-tier handling), not in the dataclass
+    # field `h.support_class` (which is never populated for built-ins). Delegate
+    # so the CLI `capabilities`/`harnesses` commands and adapters cannot drift
+    # apart. Imported lazily because adapters.py imports this module at top level.
+    from . import adapters
+    support_class = adapters.support_class(name, registry)
     return {"harness":name, "tier":h.tier, "source":h.source,
-            "support_class": h.support_class,
+            "support_class": support_class,
             "project_roots":list(h.project), "user_roots":list(h.user),
             "file_discovery":"MAPPED_NOT_VERIFIED" if h.tier in {"custom","legacy","community-mapped"}
                              else "SOURCE_DOCUMENTED",

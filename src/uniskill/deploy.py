@@ -1,4 +1,16 @@
-"""Dry-run plans, transactional installations, evidence receipts, safe rollback."""
+"""Dry-run plans, transactional installations, evidence receipts, safe rollback.
+
+Trust boundary: for project scope, the signing secret (state/secret.key) and the
+receipts it protects live INSIDE the attacker-writable workspace (state_root is
+workspace/.uniskill). That means the HMAC defends against OTHER LOCAL USERS of
+the machine, NOT against a process that can write the workspace itself (a
+same-user workspace writer can overwrite both the secret and the receipts).
+Project-scope state is therefore only as trustworthy as the workspace: signatures
+detect tampering by other users / external writers who cannot modify the
+workspace, and they fail closed, but they are not a defense against a same-user
+process already trusted with write access to the workspace. (User scope moves
+the secret under the user's home directory, improving this.)
+"""
 from __future__ import annotations
 import os
 import shutil
@@ -16,6 +28,15 @@ from .validator import validate_skill
 
 
 def state_root(scope, workspace, home, override=None):
+    """Where receipts, backups and the HMAC secret live.
+
+    Trust boundary: for project scope the returned tree is workspace/.uniskill,
+    i.e. INSIDE the attacker-writable workspace. The signatures stored here
+    protect against OTHER local users and external writers who cannot modify the
+    workspace, not against a same-user process already able to write the
+    workspace (such a process can rewrite both the secret and the receipts). Treat
+    project-scope state as only as trustworthy as the workspace it lives in.
+    """
     return Path(override) if override else (workspace / ".uniskill" if scope == "project"
                                              else home / ".local/state/uniskill")
 
@@ -80,6 +101,7 @@ def plan(skill, targets, scope, workspace, home, registry=None):
             "coverage": chosen["coverage"], "duplicate_exposure": chosen["duplicate_exposure"],
             "root_selection": chosen["selection_method"],
             "deployment": deployment, "scope_anchor": str(anchor),
+            "workspace": str(workspace.resolve()), "home": str(home.resolve()),
             "existing_discovery_collisions": collisions,
             "harness_evidence": {h: {"tier": registry[h].tier, "source": registry[h].source}
                                  for h in sorted(set(targets))},
@@ -152,8 +174,17 @@ def _cleanup_created_empty(created):
 
 
 def _receipt_body(rec):
-    return {k: rec[k] for k in ("receipt_id", "skill", "scope", "targets",
+    body = {k: rec[k] for k in ("receipt_id", "skill", "scope", "targets",
                                 "source_digest", "created_at", "state", "destinations")}
+    # Newer receipts additionally sign the re-plan source/context fields. They
+    # are included only when present so a receipt minted before the fields
+    # existed still canonicalizes identically and keeps verifying; a receipt
+    # minted with them present covers them in the HMAC, so stripping them breaks
+    # the signature rather than silently downgrading the stored plan context.
+    for k in ("source", "workspace", "home"):
+        if rec.get(k) is not None:
+            body[k] = rec[k]
+    return body
 
 
 def _read_ledger(state):
@@ -182,6 +213,11 @@ def install(p, state, replace=False):
     receipt = {"receipt_id": rid, "skill": p["skill"], "scope": p["scope"],
                "targets": p["targets"], "source_digest": p["source_digest"],
                "created_at": created_at, "state": state_field,
+               # For deterministic re-planning (the repair REINSTALL/REPLAN_ROOTS
+               # handlers reconstruct the plan from the signed receipt rather than
+               # trusting the operator to re-supply the original path).
+               "source": p["source"], "workspace": p["workspace"],
+               "home": p["home"],
                "destinations": []}
     deployment = {d["path"]: d for d in p.get("deployment", [])}
     prepared, modified, created_all = [], [], []

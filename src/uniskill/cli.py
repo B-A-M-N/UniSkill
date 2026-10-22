@@ -4,10 +4,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from .common import UniSkillError
+from .common import UniSkillError, digest_tree
 from .contract import generate_skill, load_contract
 from .deploy import (install, latest_receipt, plan, read_receipt, rollback,
                      state_root, verify_receipt)
+from .deploy import plan as deployment_plan
 from .evaluation import load_cases, run_evals
 from .harnesses import (HARNESSES, capability_profile, detect, load_registry,
                         native_discovery, opencode_diagnostics, crush_diagnostics, inspect_harness_skill)
@@ -86,6 +87,77 @@ def build_parser():
         help="Required to run repairs; without it only the plan is reported")
     return parser
 
+def _repair_handlers(*, state, receipt, registry, scope, workspace, home):
+    """Deterministic, non-destructive repair handlers wired into repair.run.
+
+    Only three interventions get a real automatic handler:
+
+    * REINSTALL / REPLAN_ROOTS (handler ``reinstall``): the deployed tree is
+      missing or not present in an active root, so it is re-planned from the
+      ORIGINAL SOURCE PATH recorded in the signed receipt and re-installed under
+      the same safety gates as a fresh install (never with an implicit
+      ``--replace`` — if the destination now holds different content, install()
+      refuses and the handler reports FAILED instead of clobbering). The digest
+      is re-verified afterwards; a rebuild that does not reach INSTALLED is
+      reported FAILED, never REPAIRED.
+    * RECONCILE_TRANSACTION (handler ``reconcile``): the tree is present but
+      drifted. This handler deliberately FAILS, naming the drifted paths, and
+      tells the operator to re-run install with their explicit consent. It never
+      overwrites operator edits.
+
+    Everything else (OPTIMIZE_TRIGGER_*, REVISE_INSTRUCTIONS_*, DECLARE_*,
+    RESOLVE_COLLISION, TRIGGER_HARNESS_RELOAD, and all policy actions) needs an
+    LLM or an operator, so they stay ADVISORY. UniSkill is deterministic-only:
+    it must not fabricate a repair it cannot honestly perform.
+    """
+    scope = receipt.get("scope", scope)
+    workspace = Path(receipt.get("workspace") or workspace)
+    home = Path(receipt.get("home") or home)
+    source = receipt.get("source")
+
+    def _reinstall(plan):  # noqa: ARG001 - repair.run calls handler(plan=plan)
+        if not source or not Path(source).is_dir():
+            return {"state": "FAILED",
+                    "detail": f"Recorded source does not exist: {source!r}",
+                    "message": "Cannot rebuild a missing deployment without its source tree"}
+        try:
+            p = deployment_plan(source, receipt["targets"], scope, workspace,
+                                home, registry)
+            result = install(p, state, replace=False)
+        except UniSkillError as exc:
+            return {"state": "FAILED", "detail": str(exc),
+                    "message": "Re-plan/install refused; no files were changed"}
+        verified = verify_receipt(result)
+        ok = verified["state"] == "INSTALLED"
+        return {"state": "REPAIRED" if ok else "FAILED",
+                "detail": {"receipt_id": result.get("receipt_id"), "source": source,
+                           "installed": verified},
+                "message": ("Deployed tree rebuilt from the signed receipt source"
+                            if ok else "Rebuild did not reach INSTALLED")}
+
+    def _reconcile(plan):  # noqa: ARG001 - repair.run calls handler(plan=plan)
+        drifted = []
+        for dest in receipt.get("destinations", []):
+            path = dest.get("path")
+            if not path:
+                continue
+            p = Path(path)
+            try:
+                observed = digest_tree(p) if (p.exists() or p.is_symlink()) else None
+            except UniSkillError:
+                observed = "INVALID_TREE"
+            if observed != dest.get("digest"):
+                drifted.append({"path": str(p), "observed_digest": observed,
+                                "expected_digest": dest.get("digest")})
+        names = ", ".join(d["path"] for d in drifted) or "<unknown>"
+        return {"state": "FAILED", "detail": {"drifted_paths": drifted},
+                "message": (f"Installed tree diverged from the receipt at {names}; "
+                            "refusing to overwrite operator edits. Re-run install with "
+                            "your explicit consent to replace.")}
+
+    return {"reinstall": _reinstall, "replan": _reinstall, "reconcile": _reconcile}
+
+
 def dispatch(args):
     cmd = args.command
     registry = load_registry(args.registry)
@@ -161,7 +233,9 @@ def dispatch(args):
         result["skill"] = args.skill
         return result
     if cmd in {"diagnose", "repair"}:
-        state = state_root(args.scope, args.workspace.resolve(), args.home.resolve(), args.state_root)
+        workspace = args.workspace.resolve()
+        home = args.home.resolve()
+        state = state_root(args.scope, workspace, home, args.state_root)
         receipt = latest_receipt(state, args.skill)
         if not receipt:
             return {"skill": args.skill, "state": "UNVERIFIED",
@@ -171,11 +245,21 @@ def dispatch(args):
         unknown = [h for h in (args.target or []) if h not in registry]
         if unknown:
             raise UniSkillError("Unknown target(s): " + ", ".join(sorted(unknown)))
-        stage_states = {
-            "installed": "PASS" if verified["state"] == "INSTALLED" else "DRIFTED"}
+        stage_states = {}
+        verify_rows = verified.get("destinations", [])
+        if verified["state"] == "INSTALLED":
+            installed_stage = "PASS"
+        elif verify_rows and all(r.get("observed_digest") is None for r in verify_rows):
+            # The deployed tree is entirely absent, not merely edited: safe to
+            # rebuild from the signed receipt source.
+            installed_stage = "MISSING"
+        else:
+            # Present but diverging from the receipt digest (or unclassifiable):
+            # an operator edit must never be silently overwritten.
+            installed_stage = "DRIFTED"
+        stage_states.update(installed=installed_stage)
         found = {h: inspect_harness_skill(args.skill, h, args.scope,
-                                          args.workspace.resolve(),
-                                          args.home.resolve(), registry)
+                                          workspace, home, registry)
                  for h in selected}
         # Roll the per-harness findings up into ONE stage verdict. Files being
         # present is a precondition for discovery, not evidence of it: a
@@ -200,11 +284,16 @@ def dispatch(args):
                 verdict = "NOT_INSTALLED"
             else:
                 verdict = "UNVERIFIED"
-            if verdict != "UNVERIFIED":
-                rollup.setdefault("discovered", verdict)
-                if precedence.index(verdict) < precedence.index(
-                        rollup.get("discovered", "UNVERIFIED")):
-                    rollup["discovered"] = verdict
+            # Every harness contributes a verdict, including "unproven". Dropping
+            # UNVERIFIED here would leave the discovered stage absent entirely,
+            # making a never-probed skill indistinguishable from a fully-proven
+            # one and letting diagnose() report CLEAN where status() reports the
+            # gap. Failures outrank plain lack of evidence.
+            current = rollup.get("discovered", "UNVERIFIED")
+            if precedence.index(verdict) < precedence.index(current):
+                rollup["discovered"] = verdict
+        # No harness at all means nothing was inspected: still not proof.
+        rollup.setdefault("discovered", "UNVERIFIED")
         stage_states = {**stage_states, **rollup}
         row = diagnosis.diagnose(stage_states,
                                  evidence={h: found[h] for h in found})
@@ -229,7 +318,10 @@ def dispatch(args):
             return {**report, "repair_plan": plan_item.as_dict(),
                     "budget": budget.remaining(),
                     "note": "Dry run. Pass repair --execute to apply."}
-        outcome = repair.run(budget, [plan_item], {}, allow_policy=args.allow_policy)
+        handlers = _repair_handlers(state=state, receipt=receipt, registry=registry,
+                                    scope=args.scope, workspace=workspace,
+                                    home=home)
+        outcome = repair.run(budget, [plan_item], handlers, allow_policy=args.allow_policy)
         return {**report, "repair": outcome}
     if cmd == "evaluate":
         cases = load_cases(args.cases)

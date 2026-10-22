@@ -8,7 +8,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from .common import (UniSkillError, assert_no_symlink_chain, canonical_bytes,
+from .common import (UniSkillError, assert_no_symlink_chain,
                      digest_tree, dump_json, in_tree, load_signing_key,
                      read_json, sign_receipt_body, verify_receipt_signature)
 from .harnesses import HARNESSES, choose_roots, roots

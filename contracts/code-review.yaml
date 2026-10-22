@@ -1,0 +1,37 @@
+skill: code-review
+goal: Perform a thorough code review of a pull request focusing on security, correctness and maintainability.
+triggers:
+  positive:
+    - review this PR
+    - check for security issues in this pull request
+    - is this code reviewable
+  negative:
+    - explain git basics
+    - write a tutorial on testing
+preconditions:
+  - The repository and PR are accessible.
+  - CI has passed or is not required for this change.
+capabilities:
+  required:
+    - code.search
+    - filesystem.read
+  optional:
+    - shell
+    - test.execution
+workflow:
+  - Read the diff and understand the intent.
+  - Check for security issues: injection, auth bypass, data exposure.
+  - Verify type safety and error handling.
+  - Assess readability and maintainability.
+  - Suggest concrete improvements with code examples.
+outputs:
+  - Categorized findings (security, correctness, style).
+  - Specific line references for each finding.
+  - Overall approval or reject recommendation.
+invariants:
+  - No unrelated code changes.
+  - No invented findings without code evidence.
+  - Negative findings must include a specific code reference.
+acceptance_tests:
+  - Detects an intentional SQL injection pattern in a fixture.
+  - Refuses to approve PR with failing type checks.

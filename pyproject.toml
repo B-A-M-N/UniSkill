@@ -16,3 +16,7 @@ uniskill = "uniskill.cli:main"
 where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `_scratch_review` holds ad-hoc probes written during review and `_red_orig`
+# holds the reconstructed vulnerable original used for RED proofs. Neither is
+# part of the suite; both are excluded from collection.
+norecursedirs = ["_scratch_review", "_red_orig", "__pycache__"]

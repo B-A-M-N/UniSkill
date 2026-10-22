@@ -83,12 +83,22 @@ This works for forks and experimental TUIs without pretending they expose a nati
 | `plan PATH --target X Y` | Dry-run destinations, shared coverage, prior digests, shadowing candidates |
 | `install PATH --target X Y --apply` | File tree copied and hashed; no native discovery claim |
 | `verify NAME --probe` | Installed hash verified; Gemini CLI native list check when available |
-| `status NAME` | Receipt state, without manufacturing discovery/functional results |
+| `status NAME` | Layered per-stage status; nothing beyond installation is claimed without a probe |
 | `doctor NAME --target X Y` | Known on-disk candidates and applicable static policy issues, with or without receipts |
-| `rollback RECEIPT` | Reverts a deployment only if installed tree is untouched |
+| `diagnose NAME [--target X Y]` | Earliest failing lifecycle stage and its single matched intervention |
+| `repair NAME [--execute]` | Bounded repair plan for that diagnosis; never claims success it cannot evidence |
+| `rollback RECEIPT` | Reverts a deployment only if the installed tree is untouched and no newer receipt owns it |
 | `evaluate CASES --runner-config FILE --execute` | Operator-approved evaluator subprocess and output/tool-trace assertions |
 
 Use `--scope user --home /path/to/home` for a user-scoped plan/install. Use `--workspace` for project scope. Use `--state-root` if you want receipts and backups in a nondefault location.
+
+### Diagnosis and repair
+
+`diagnose` reduces the lifecycle to **one** actionable failure: the earliest stage that is actually broken. A later stage failing is treated as a consequence, not repaired independently.
+
+- A skill whose files are present but whose runtime was never probed diagnoses as `CLEAN` — files are a precondition for discovery, not evidence of it. `repair` then reports `NO_REPAIR` rather than inventing work.
+- Policy denials, required project trust, and security quarantine are reported as **blockers**. UniSkill stops and asks for operator action; it never edits harness policy to make a problem disappear.
+- `repair` runs under an attempt/cost budget (`--max-attempts`, `--max-cost`), reports `ADVISORY` when no automatic handler exists for an intervention, and never weakens a permission, grants a credential, skips consent, or drops an invariant to improve a result. Policy-touching actions require `--allow-policy`.
 
 ## Evidence model
 
@@ -97,6 +107,19 @@ These stages are independent:
 `SPECIFIED → VALID → INSTALLABLE → INSTALLED → DISCOVERED → INVOKABLE → AUTOSELECTED → FUNCTIONAL → REGRESSION_PASS → PORTABLE`
 
 `BLOCKED`, `FAILED`, `UNSUPPORTED` and `UNVERIFIED` are **not** synonyms. Missing runtime proof stays `UNVERIFIED`. A denied skill permission is not a pretext for weakening policy. `uniskill status` currently only certifies the installed stage from receipts/hashes. Do not present a test runner's matching output regex as proof of trigger selection or real-harness compatibility.
+
+### Harness support is a classified claim, not a vibe
+
+Each harness carries a `support_class`, and the classes are deliberately unequal:
+
+| Class | Meaning | Harnesses |
+| --- | --- | --- |
+| `FUNCTIONAL_VERIFIED` | UniSkill executed the harness and observed correct behavior | none |
+| `DISCOVERY_PROBED` | A real native probe exists and can be run | `gemini` |
+| `NATIVE_DOCUMENTED` | The vendor documents a mechanism UniSkill does not itself execute | `kimi-code-cli` |
+| `INSTALL_ONLY` | Copy targets are known; nothing about runtime behavior is known | the other 27, and every custom profile |
+
+Knowing where a harness reads skills is **not** knowing that it loaded one. `discover()` returns `UNVERIFIED` with a reason unless a genuine probe ran, so filesystem presence alone can never produce a discovery claim. Where a harness needs project trust before loading (Hermes) or is disabled by configuration (Crush `crushrc`), the adapter reports the blocker instead of the copy.
 
 ## Evaluations
 

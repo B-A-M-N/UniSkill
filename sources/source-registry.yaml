@@ -1,0 +1,66 @@
+# These are manual source identifiers and review dates, not automated freshness guarantees.
+version: '2026-10-21'
+sources:
+  agent-skills-standard:
+    url: https://agentskills.io/specification
+    classification: standard-requirement
+    reviewed: '2026-10-21'
+    supports: [portable-frontmatter, directory-name-match, resources]
+  anthropic-complete-guide:
+    url: https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
+    classification: conditional-technique
+    reviewed: '2026-10-21'
+    supports: [workflow-patterns, use-case-first-design]
+    note: The user-provided Complete Guide provides the detailed synthesis; verify exact revision when available.
+  anthropic-best-practices:
+    url: https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices
+    classification: general-best-practice
+    reviewed: '2026-10-21'
+    supports: [progressive-disclosure, evaluation, instruction-freedom]
+  anthropic-skill-creator:
+    url: https://github.com/anthropics/skills
+    classification: general-best-practice
+    reviewed: '2026-10-21'
+    supports: [creation, testing, trigger-optimization]
+  openai-skill-creator:
+    url: https://github.com/openai/skills
+    classification: general-best-practice
+    reviewed: '2026-10-21'
+    supports: [minimal-context, behavioral-guidance]
+  vscode-customization:
+    url: https://code.visualstudio.com/docs/agent-customization/agent-skills
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [copilot-discovery, hooks-boundaries]
+  gemini-skills:
+    url: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/skills.md
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [native-list, activation-consent, reload]
+  opencode-skills:
+    url: https://docs.opencode.ai/docs/skills/
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [discovery-roots, per-agent-permissions]
+  cursor-skills:
+    url: https://prod.cursor.com/docs/skills
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [shared-roots, local-vs-cloud-sync]
+  crush-native-skills:
+    url: https://github.com/charmbracelet/crush#agent-skills
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [multiple-skill-roots, disable-skill, configured-roots]
+  jcode-source-inspection:
+    source: local /home/bamn/jcode/crates/jcode-base/src/skill.rs
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [jcode-project-overlays, jcode-global-skill-roots, shared-agents-root]
+    note: Reviewed local source; runtime session verification not performed.
+  vercel-cross-agent-mappings:
+    url: https://github.com/vercel-labs/skills/blob/main/docs/agents.md
+    classification: harness-specific-behavior
+    reviewed: '2026-10-21'
+    supports: [community-mapped-harness-roots]
+    note: Install path mappings only; no independent runtime compatibility guarantee.

@@ -1,0 +1,2 @@
+{"id":"positive","prompt":"Audit the backend for concurrency bottlenecks and cite code evidence.","must_include":["contention|concurrency|bottleneck"],"must_not_include":["deployed to production"],"forbidden_tools":["deployment"]}
+{"id":"nearby-negative","prompt":"Explain what a mutex is.","must_include":["mutex|lock"]}

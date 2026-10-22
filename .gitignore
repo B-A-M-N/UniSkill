@@ -1,0 +1,9 @@
+.uniskill/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+.pytest_cache
+build/
+dist/
+.opencode/

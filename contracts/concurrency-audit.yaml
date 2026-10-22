@@ -1,0 +1,36 @@
+skill: concurrency-audit
+goal: Identify meaningful throughput and concurrency bottlenecks without changing unrelated behavior.
+triggers:
+  positive:
+    - audit this backend for concurrency bottlenecks
+    - find throughput bottlenecks
+    - review worker pool contention
+  negative:
+    - explain what a mutex is
+    - fix this isolated race condition
+preconditions:
+  - Repository is readable.
+capabilities:
+  required:
+    - filesystem.read
+    - code.search
+  optional:
+    - shell
+    - test.execution
+workflow:
+  - Map request handling, queues, shared locks, workers and timeouts.
+  - Identify serialized or blocking hot paths with source-level evidence.
+  - Measure a representative baseline where feasible and safe.
+  - Prioritize high leverage fixes and explain invariants at risk.
+  - Recommend minimal changes and exact regression checks.
+outputs:
+  - Evidence-backed ranked bottleneck report.
+  - Specific source locations and suggested verification steps.
+invariants:
+  - No unrelated code changes.
+  - No production deployment.
+  - No invented performance measurements.
+acceptance_tests:
+  - Finds an intentionally serialized hot path in a fixture.
+  - Attributes high-severity findings to actual code evidence.
+  - Refuses to fabricate bottlenecks without evidence.

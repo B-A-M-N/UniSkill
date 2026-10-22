@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: uniskill
+Version: 0.2.0
+Summary: Evidence-driven portable Agent Skills engineering
+License: Apache-2.0
+Requires-Python: >=3.10
+License-File: LICENSE
+License-File: NOTICE
+Requires-Dist: PyYAML<7,>=6
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+Dynamic: license-file

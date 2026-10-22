@@ -1,0 +1,45 @@
+version: '2026-10-21'
+classification_vocabulary:
+  - standard-requirement
+  - general-best-practice
+  - conditional-technique
+  - harness-specific-behavior
+  - experimental-unverified
+principles:
+  - id: behavioral-contract-first
+    class: general-best-practice
+    rule: Write a testable, harness-neutral definition of goals, triggers, invariants and observables before drafting SKILL.md.
+    sources: [agent-skills-standard, anthropic-complete-guide, openai-skill-creator]
+  - id: minimal-instruction
+    class: general-best-practice
+    rule: Include decision-changing instructions and domain-specific constraints; avoid repeating general agent abilities.
+    sources: [openai-skill-creator, anthropic-best-practices]
+  - id: progressive-disclosure
+    class: standard-requirement
+    qualifier: Recommended organization, not a hard schema requirement.
+    rule: Keep main SKILL.md focused and put supporting knowledge in references/ for on-demand access.
+    sources: [agent-skills-standard, anthropic-best-practices]
+  - id: degrees-of-freedom
+    class: conditional-technique
+    rule: Allow flexibility in low-risk creative steps; use deterministic scripts and explicit checks where operations are fragile.
+    sources: [anthropic-best-practices, vscode-customization]
+  - id: method-selection
+    class: conditional-technique
+    rule: Select sequential orchestration, multi-MCP coordination, iterative refinement, context-aware tool selection, or domain-specific intelligence only when justified by the workflow.
+    sources: [anthropic-complete-guide]
+  - id: evaluation-before-expansion
+    class: general-best-practice
+    rule: Establish baseline without skill, evaluate triggers and functionality separately, measure candidate improvements, and run held-out regressions.
+    sources: [anthropic-skill-creator, openai-skill-creator]
+  - id: enforcement-boundary
+    class: general-best-practice
+    rule: Model instructions cannot replace hooks, permission mechanisms or non-model enforcement for must-always-happen requirements.
+    sources: [vscode-customization]
+  - id: no-success-shortcut
+    class: general-best-practice
+    rule: Filesystem install is not proof of discovery, invocation, automatic selection, or correct execution.
+    sources: [gemini-skills, opencode-skills, cursor-skills]
+  - id: permission-fence
+    class: general-best-practice
+    rule: Never repair missing permissions by silently weakening policy, granting credentials, or skipping consent.
+    sources: [gemini-skills, opencode-skills]

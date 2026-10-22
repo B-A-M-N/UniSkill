@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "uniskill"
+version = "0.2.0"
+description = "Evidence-driven portable Agent Skills engineering"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6,<7"]
+license = {text = "Apache-2.0"}
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+[project.scripts]
+uniskill = "uniskill.cli:main"
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,17 @@
+{
+  "harnesses": {
+    "inhouse-agent": {
+      "executable": "inhouse-agent",
+      "project_roots": [".inhouse-agent/skills"],
+      "user_roots": [".inhouse-agent/skills"],
+      "source": "operator-supplied specification, runtime unverified"
+    },
+    "jcode": {
+      "override": true,
+      "executable": "jcode",
+      "project_roots": [".jcode/skills", ".agents/skills", ".claude/skills"],
+      "user_roots": [".jcode/skills", ".agents/skills"],
+      "source": "local jcode source-inspected mapping (example explicit override)"
+    }
+  }
+}

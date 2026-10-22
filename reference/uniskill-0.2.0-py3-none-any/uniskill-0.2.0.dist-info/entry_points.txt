@@ -1,0 +1,2 @@
+[console_scripts]
+uniskill = uniskill.cli:main

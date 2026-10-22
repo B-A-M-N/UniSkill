@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Tuple
 
 import yaml
 
@@ -75,7 +74,7 @@ _KIMI_CODE_HOME_DEFAULT = ".kimi-code"
 # ---------------------------------------------------------------------------
 
 
-def frontmatter_manual_only(skill_dir: Path) -> bool | False | None:
+def frontmatter_manual_only(skill_dir: Path) -> bool | None:
     """Return True/False/UNKNOWN whether a skill's frontmatter marks it manual-only.
 
     Documented across Kimi (disableModelInvocation), Crush (disable-model-invocation),
@@ -97,7 +96,7 @@ def frontmatter_manual_only(skill_dir: Path) -> bool | False | None:
     return False
 
 
-def frontmatter_user_invocable(skill_dir: Path) -> bool | False | None:
+def frontmatter_user_invocable(skill_dir: Path) -> bool | None:
     """Return True/False/UNKNOWN whether a skill is user-invocable (slash command).
 
     Only Crush documents a `user-invocable` frontmatter marker.

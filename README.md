@@ -1,198 +1,222 @@
 # UniSkill
 
-**Portable, evidence-driven Agent Skills engineering.** UniSkill creates deterministic `SKILL.md` scaffolds from behavioral contracts, validates skill packages, plans deduplicated multi-harness deployment, installs transactionally, diagnoses common discovery failures, and runs explicitly configured evaluation cases. It reports exactly what was measured.
+**Build, validate, deploy, and evaluate agent skills across multiple coding harnesses.**
 
-This is a **working Python CLI and an agent-facing skill**, not a completed autonomous skill optimizer or a production-certified universal runtime. In particular, installation alone never proves a harness loaded, invoked, selected, or correctly executed a skill.
+UniSkill is a Python CLI and agent-facing skill for engineering portable `SKILL.md` packages. It combines contract-based scaffolding, structural validation, harness-aware installation, deployment rollback, troubleshooting, and evidence-based evaluation in one workflow.
 
-## Install and try it
+Instead of assuming a skill works because its files exist in the right directory, UniSkill distinguishes **installation**, **runtime discovery**, **invocation**, **automatic selection**, and **functional correctness**.
 
-Python 3.10+ required. Run from the extracted source tree:
+> [!IMPORTANT]
+> **Project status — v0.2.0:** UniSkill is a working, early-stage CLI, not a fully autonomous skill optimizer or a certification of universal harness compatibility. Installation is implemented for mapped targets; live functional verification is not yet available for most harnesses. See [Current limitations](#current-limitations).
+
+## Why UniSkill?
+
+Agent skills are increasingly portable in format, but their discovery paths, activation rules, permissions, and execution behavior differ among harnesses. A valid `SKILL.md` does not guarantee that a particular agent will load it—or use it when appropriate.
+
+UniSkill addresses the repeatable parts of that problem:
+
+- **Create from contracts:** generate consistent skill scaffolds from explicit behavioral requirements.
+- **Validate before deployment:** check package structure and reject unsafe payload features, including symlinked skill content.
+- **Target multiple harnesses:** inspect documented and community-mapped install roots through a data-driven adapter registry.
+- **Plan before writing:** show proposed destinations, shared-root deduplication, existing installations, and possible shadowing.
+- **Install with rollback:** apply changes explicitly, record file digests and receipts, and protect manually modified files.
+- **Diagnose failures:** distinguish missing files, conflicts, trust requirements, policy restrictions, and unverified runtime stages.
+- **Evaluate behavior:** run explicitly authorized external test runners, inspect real workspace changes, repeat trials, and compare regression baselines.
+
+## Quick start
+
+**Requirements:** Python 3.10+; Python package dependencies are installed from `pyproject.toml`. Clone the repository and install locally:
 
 ```bash
+git clone https://github.com/B-A-M-N/UniSkill.git
+cd UniSkill
 python -m pip install -e .
+```
+
+Explore the available harness mappings, validate the included skill, and create a new package from the sample contract:
+
+```bash
 uniskill harnesses
 uniskill validate skills/universal-skill-engineer
 uniskill create contracts/concurrency-audit.yaml --out /tmp/concurrency-audit
-uniskill plan /tmp/concurrency-audit --target jcode crush opencode codex \
-  --workspace /path/to/test-repo
 ```
 
-**No files are written by `plan` or by `install` without `--apply`.** Inspect the plan before deploying:
+Preview deployment to several harnesses within a project:
 
 ```bash
-uniskill install /tmp/concurrency-audit --target jcode crush opencode codex \
-  --workspace /path/to/test-repo --apply
-uniskill status concurrency-audit --workspace /path/to/test-repo
-uniskill doctor concurrency-audit --target jcode crush opencode \
-  --workspace /path/to/test-repo
+uniskill plan /tmp/concurrency-audit \
+  --target jcode crush opencode codex \
+  --workspace /path/to/project
 ```
 
-`install` outputs a `receipt_id`. To reverse that deployment (only while the deployed files still match the receipt):
+**`plan` does not write files.** Installation also requires an explicit `--apply`:
 
 ```bash
-uniskill rollback '<receipt-id>' --workspace /path/to/test-repo
+uniskill install /tmp/concurrency-audit \
+  --target jcode crush opencode codex \
+  --workspace /path/to/project --apply
+
+uniskill status concurrency-audit --workspace /path/to/project
+uniskill doctor concurrency-audit \
+  --target jcode crush opencode \
+  --workspace /path/to/project
 ```
 
-`--replace` explicitly authorizes replacing a previously different target; UniSkill saves the original in its backup store for rollback. It refuses to remove manually edited installed files on rollback.
+Each applied installation returns a `receipt_id`. If installed files have not subsequently changed, UniSkill can reverse the deployment:
 
-## Harness coverage is layered
+```bash
+uniskill rollback '<receipt-id>' --workspace /path/to/project
+```
 
-| Support tier | Meaning | Examples |
+Use `--scope user --home /path/to/home` for user-scoped deployment. `--state-root` allows receipts and backups to be stored separately.
+
+## Core workflow
+
+| Stage | Command | Purpose |
 | --- | --- | --- |
-| `local-source` | Installation roots inspected in local source | `jcode` |
-| `documented` | Native locations backed by vendor documentation | Claude Code, Codex, OpenCode, Gemini CLI, Cursor, Copilot, Crush |
-| `community-mapped` | Published installer root mapping; runtime not proven | Hermes, Pi, Kimi Code CLI, Cline, Goose, Amp, Zed, Warp, OpenHands, Qwen Code, DeepAgents, Kiro, and others |
-| `legacy` | Root mapping for an older/archived harness | Roo Code |
-| `custom` | User-supplied roots; zero implied runtime support | Any in-house agent, wrapper, fork, new harness |
+| Author | `create CONTRACT --out PATH` | Generate a deterministic `SKILL.md` package from a contract. |
+| Validate | `validate PATH [--target NAME]` | Check portable package structure; optionally inspect target-specific constraints. |
+| Discover targets | `harnesses`, `capabilities NAME`, `detect` | List adapter metadata and find locally available harness executables. |
+| Preview | `plan PATH --target X Y` | Inspect destinations, shared roots, installed digests, and conflicts without writing. |
+| Deploy | `install PATH --target X Y --apply` | Copy the package and record a reversible deployment receipt. |
+| Inspect | `verify NAME --probe`, `status NAME`, `doctor NAME` | Check installed content and available discovery evidence. |
+| Troubleshoot | `diagnose NAME`, `repair NAME [--execute]` | Identify the earliest supported failure and plan or execute a bounded repair. |
+| Roll back | `rollback RECEIPT` | Revert an unchanged deployment without discarding later/manual edits. |
+| Test | `evaluate CASES --runner-config FILE --execute` | Run operator-configured behavioral tests and collect evidence. |
 
-All tiers still require separate native functional tests. See `uniskill harnesses` or `uniskill capabilities jcode` for the current detailed map.
+**Safe deployment is the default.** UniSkill does not silently overwrite different installed content. The `--replace` option explicitly authorizes replacement and preserves the previous version for supported rollback operations. Rollback refuses to delete content changed outside UniSkill or owned by a newer receipt.
 
-### jcode: source-inspected native roots
+## Harness compatibility
 
-The `jcode` adapter is based on its Rust loader (`crates/jcode-base/src/skill.rs`), not an assumption that it uses Codex or OpenCode's configuration. Native discovery locations:
+UniSkill separates *knowledge of a harness's skill locations* from *proof that the harness successfully loads and executes a skill*.
 
-- Project: `.jcode/skills`, `.agents/skills`, `.claude/skills`.
-- User: `~/.jcode/skills`, `~/.agents/skills`.
+| Mapping tier | Basis | Representative harnesses |
+| --- | --- | --- |
+| **Local-source** | Install roots inspected in harness source code | jcode |
+| **Documented** | Install locations described by vendor documentation | Claude Code, Codex, OpenCode, Gemini CLI, Cursor, GitHub Copilot, Crush |
+| **Community-mapped** | Published ecosystem mappings; runtime behavior not verified | Hermes, Pi, Kimi Code CLI, Cline, Goose, Amp, Zed, Warp, OpenHands, Qwen Code, Kiro, DeepAgents |
+| **Legacy** | Mapping retained for an older or archived integration | Roo Code |
+| **Custom** | Explicit user-defined roots | Local agents, forks, proprietary or experimental harnesses |
 
-Project definitions are per-workspace overlays, not global daemon state. jcode can load skills through its `skill_manage` tool; the CLI in this release **does not drive a live jcode daemon or call that tool automatically**. If a skill does not appear, inspect the active session working directory, whether a global skill with the same name is shadowed, and reload behavior. `uniskill doctor` checks file candidates, not live session bindings.
+The complete registry is available from `uniskill harnesses`; use `uniskill capabilities NAME` to inspect an individual target's support class, roots, and provenance.
 
-### Crush: documented native and shared roots
+### Important harness-specific behavior
 
-Crush recognizes `.crush/skills`, `.agents/skills`, `.claude/skills`, and `.cursor/skills` in a project and its configured global locations. `option disable-skill` can hide a skill even when it is correctly installed; extra paths can be configured through Crush. This version covers standard static roots; for custom `CRUSH_SKILLS_DIR` or configured paths, provide an explicit custom registry profile rather than assuming that filesystem presence proves activation.
+**jcode:** the adapter uses source-inspected project roots (`.jcode/skills`, `.agents/skills`, `.claude/skills`) and user roots (`~/.jcode/skills`, `~/.agents/skills`). UniSkill installs files but does not call jcode's live `skill_manage` tool or interact with a running daemon.
 
-### Private / exotic harness support
+**Crush:** native and shared skill directories are mapped. Skills may still be hidden by configuration (including `disable-skill`), and custom `CRUSH_SKILLS_DIR` or other configured paths require an explicit registry profile.
 
-The adapter registry is deliberately **data-driven**. Copy `examples/custom-harnesses.json`, define documented relative project/user skill roots, and pass it with the global `--registry` option before the subcommand:
+**Other harnesses:** root mappings describe possible installation locations, not evidence of discovery or successful execution. Currently, Gemini CLI has a native discovery-text probe; the other harnesses are not universally runtime-probed or functionally certified.
+
+### Add an experimental or private harness
+
+The adapter registry is data-driven. Start with [`examples/custom-harnesses.json`](examples/custom-harnesses.json), define safe project/user-relative skill locations, and pass the registry before the command:
 
 ```bash
 uniskill --registry examples/custom-harnesses.json capabilities inhouse-agent
-uniskill --registry examples/custom-harnesses.json plan skills/universal-skill-engineer \
-  --target inhouse-agent jcode --workspace /path/to/test-repo
+
+uniskill --registry examples/custom-harnesses.json \
+  plan skills/universal-skill-engineer \
+  --target inhouse-agent jcode \
+  --workspace /path/to/project
 ```
 
-This supports forks and experimental TUIs without claiming they expose a native discovery API. A profile **does not automatically add a runtime driver**; for executable validation, supply a trusted harness runner described below. For built-ins, `override: true` is required to override defaults. Discovery-root paths must be safe and relative to the selected workspace or home; arbitrary system paths are refused.
+Custom mappings do **not** create a runtime driver. Built-in profiles require `override: true` to be replaced. Arbitrary system paths are not accepted as discovery roots.
 
-## Commands
+## Evidence and evaluation
 
-| Command | What it proves |
+UniSkill models skill readiness as separate stages:
+
+```text
+SPECIFIED → VALID → INSTALLABLE → INSTALLED → DISCOVERED
+          → INVOKABLE → AUTOSELECTED → FUNCTIONAL
+          → REGRESSION_PASS → PORTABLE
+```
+
+`BLOCKED`, `FAILED`, `UNSUPPORTED`, and `UNVERIFIED` represent different outcomes. A receipt and matching file hashes support an *installed* claim; they do not establish runtime discovery or correct behavior. Likewise, a runner's claim that a tool was called is not automatically proof that the harness performed it.
+
+### Behavioral test types
+
+| Type | What it checks |
 | --- | --- |
-| `create CONTRACT --out PATH` | Deterministic skill source generated; not optimized by an LLM |
-| `validate PATH [--target NAME]` | Portable structure valid; target-specific features remain unverified |
-| `harnesses`, `capabilities NAME` | Profile mapping and provenance |
-| `detect` | Harness executables on `PATH` (does not establish support) |
-| `plan PATH --target X Y` | Dry-run destinations, shared coverage, prior digests, shadowing candidates |
-| `install PATH --target X Y --apply` | File tree copied and hashed; no native discovery claim |
-| `verify NAME --probe` | Installed hash verified; Gemini CLI native list check when available |
-| `status NAME` | Layered per-stage status; nothing beyond installation is claimed without a probe |
-| `doctor NAME --target X Y` | Known on-disk candidates and applicable static policy issues, with or without receipts |
-| `diagnose NAME [--target X Y]` | Earliest failing lifecycle stage and its single matched intervention |
-| `repair NAME [--execute]` | Bounded repair plan for that diagnosis; reports success only when supported by evidence |
-| `rollback RECEIPT` | Reverts a deployment only if the installed tree is untouched and no newer receipt owns it |
-| `evaluate CASES --runner-config FILE --execute` | Operator-approved evaluator subprocess and output/tool-trace assertions |
+| `discovery` | Whether the native harness identifies a skill, including negative discovery cases |
+| `invocation` | Whether the skill is explicitly invoked, or must not be invoked |
+| `selection` | Whether the harness selects the skill automatically, including negative cases |
+| `functionality` | Required behavior and artifacts, prohibited side effects, and output constraints |
+| `regression` | Whether previously established behavior continues to pass against a baseline |
 
-Use `--scope user --home /path/to/home` for a user-scoped plan/install. Use `--workspace` for project scope. Use `--state-root` if you want receipts and backups in a nondefault location.
+Evaluation uses an **explicitly configured, trusted external runner**. UniSkill supplies prompts and evaluates outputs and measurements; it does not silently launch agent sessions or provision their credentials.
 
-### Diagnosis and repair
+Evidence includes:
 
-`diagnose` reduces the lifecycle to **one** actionable failure: the earliest stage that is actually broken. A later stage failing is treated as a consequence, not repaired independently.
+- **Measured workspace diffs:** pre/post file hashes verify actual artifacts and detect forbidden changes or edits outside allowed prefixes.
+- **Process observations:** exit codes and timeouts are independently observed.
+- **Runner assertions:** response text and reported tool calls are supported but labeled *runner-asserted*, not independently measured.
+- **Repeated trials:** pass rates and Wilson 95% confidence intervals characterize reliability. Fewer than five trials are preliminary; inconsistent outcomes are flagged as unreliable.
+- **Regression baselines:** previously passing behavior can be compared with a new run to identify regressions rather than treating them as ordinary failures.
 
-- A skill whose files are present but whose runtime was not probed diagnoses as `CLEAN` — files are a precondition for discovery, not evidence of it. `repair` then reports `NO_REPAIR` when no intervention is supported by the diagnosis.
-- Policy denials, required project trust, and security quarantine are reported as **blockers**. UniSkill stops and asks for operator action; it never edits harness policy to make a problem disappear.
-- `repair` runs under an attempt/cost budget (`--max-attempts`, `--max-cost`), reports `ADVISORY` when no automatic handler exists for an intervention, and never weakens a permission, grants a credential, skips consent, or drops an invariant to improve a result. Policy-touching actions require `--allow-policy`.
-
-## Evidence model
-
-These stages are independent:
-
-`SPECIFIED → VALID → INSTALLABLE → INSTALLED → DISCOVERED → INVOKABLE → AUTOSELECTED → FUNCTIONAL → REGRESSION_PASS → PORTABLE`
-
-`BLOCKED`, `FAILED`, `UNSUPPORTED` and `UNVERIFIED` are distinct states. Missing runtime proof remains `UNVERIFIED`. A denied skill permission does not justify weakening policy. `uniskill status` currently certifies only the installed stage from receipts and hashes. A test runner's matching output regex does not establish trigger selection or compatibility with a real harness.
-
-### Harness support classifications
-
-Each harness carries a `support_class`, and the classes are deliberately unequal:
-
-| Class | Meaning | Harnesses |
-| --- | --- | --- |
-| `FUNCTIONAL_VERIFIED` | UniSkill executed the harness and observed correct behavior | none |
-| `DISCOVERY_PROBED` | A real native probe exists and can be run | `gemini` |
-| `NATIVE_DOCUMENTED` | The vendor documents a mechanism UniSkill does not itself execute | `kimi-code-cli` |
-| `INSTALL_ONLY` | Copy targets are known; nothing about runtime behavior is known | the other 27, and every custom profile |
-
-Knowing where a harness reads skills is **not** knowing that it loaded one. `discover()` returns `UNVERIFIED` with a reason unless a genuine probe ran, so filesystem presence alone can never produce a discovery claim. Where a harness requires project trust before loading (Hermes) or is disabled by configuration (Crush `crushrc`), the adapter reports that blocker rather than treating copied files as sufficient.
-
-## Evaluations
-
-UniSkill supports a **trusted, explicitly configured** external runner protocol. The runner receives the test prompt through stdin. For isolation, configure the runner to start an agent instance with separately managed credentials, permissions, budget, and a disposable workspace. It returns text or structured JSON:
-
-```json
-{"response":"Audit complete", "tool_calls":[{"name":"search"}]}
-```
-
-### Four test types
-
-Every case carries a `type` field:
-
-| Type | Question | Negative form |
-|---|---|---|
-| `discovery` | Did the runtime identify the correct skill? | `must_not_match_skill` — the skill must NOT surface for that prompt |
-| `invocation` | Did the runtime **explicitly** invoke the skill? | `must_not_invoke_skill` |
-| `selection` | Did the runtime **automatically** select it? | `must_not_select_skill` |
-| `functionality` | Did it produce the required artifacts and behavior, with no forbidden side effects? | `forbidden_artifacts`, `allowed_diff_prefix` |
-| `regression` | Does the current run preserve previously established behavior? | compared against a stored baseline |
-
-A case with no `type` defaults to `functionality`, and the original assertion keys (`must_include`, `must_not_include`, `required_tools`, `forbidden_tools`, `expected_exit_code`) keep working. See the typed examples in `evals/discovery-cases.jsonl`, `evals/invocation-cases.jsonl`, `evals/selection-cases.jsonl`, `evals/functionality-cases.jsonl`, plus `evals/example.jsonl` and `examples/runner.json`.
-
-### Measured evidence vs runner-asserted evidence
-
-A runner's self-report is not proof. Where possible the evaluator **measures** instead of trusting:
-
-- **Workspace snapshot diff**: the evaluator snapshots the workspace tree (path → digest) before the run and diffs it after. `required_artifacts` are checked against the actual diff — a runner whose prose claims success but whose diff shows no artifact is **FAILED** by measured evidence. `forbidden_artifacts` and `allowed_diff_prefix` catch side effects the runner never mentions.
-- **Exit code and timeout**: OS-level; a timeout is its own state, not a generic failure.
-- **Runner-claimed `tool_calls` and `response` text** remain allowed but are labeled `evidence_type: "runner-asserted"` and can never alone prove a functionality case. A case whose only assertions are runner-asserted ones is visibly marked in the aggregate report (`verification_class: "runner-asserted-only"`).
-
-Where no harness-native probe exists (e.g. discovery for most harnesses), the evaluator returns `UNVERIFIED` for that case, not `FAILED` — the harness lacking a probe is not the skill failing.
-
-### Reliability across repetitions
-
-One successful response is not proof. Per-case reliability is computed over `--repetitions` trials: pass rate, a Wilson 95% confidence interval, and an honest verdict. Fewer than 5 trials is reported as `TOO_FEW` ("preliminary, not certified"). A case that passes in some trials and fails in others is reported **flaky/UNRELIABLE** — its own finding, distinct from a plain failure.
-
-### Regression baselines
-
-`baselines_save` / `baseline_load` (JSON, e.g. `evals/baselines/<skill>.json`) store previously-passing results. A `regression`-type case that passed in the baseline and fails now is reported as **REGRESSION** — distinct from a plain `FAILED` — because a regression is the trigger for "reject candidate or roll back", not for another optimization round.
+Example:
 
 ```bash
 uniskill evaluate evals/functionality-cases.jsonl \
-  --runner-config examples/runner.json --repetitions 3 --execute \
-  --workspace /path/to/measured/tree --baseline evals/baselines/my-skill.json
+  --runner-config examples/runner.json \
+  --repetitions 5 --execute \
+  --workspace /path/to/measured/tree \
+  --baseline evals/baselines/my-skill.json
 ```
 
-`--workspace` names the measured tree for snapshot-diff evidence; it must be the runner's working directory (the evaluator refuses to silently diff two different trees). `--baseline` enables regression comparison for `regression`-type cases.
+The measured workspace must be the same tree the runner actually changes. See [`evals/`](evals/) for typed example cases and [`examples/runner.json`](examples/runner.json) for the runner configuration format.
 
-The included `echo_runner.py` is a fixture, **not** a real agent execution backend. Its passing assertions prove that the evaluation machinery works, not that a particular skill works. Execution can run arbitrary trusted local binaries, so it must be requested with `--execute`; do not point it at untrusted scripts. The evaluator only ever launches the explicitly configured runner — it never executes anything implicitly.
+> [!WARNING]
+> The included `echo_runner.py` is a test fixture, not a real coding agent. A passing fixture validates evaluation mechanics—not a skill's performance in Claude Code, Codex, OpenCode, jcode, or another harness. `--execute` can launch trusted local subprocesses; do not point it at untrusted programs.
 
-## What is built and what remains
+## Diagnosis and repair
 
-**Implemented:** canonical contract validation/scaffolding; portable static validation; rejection of symlinked skill payloads; digest-based deployment; preflight shared-root planning; safe relative custom adapter registry; existing duplicate/shadow detection; multiple harness roots; explicit apply/replace gates; receipt and backup storage; protected rollback; Gemini CLI discovery-text probe; jcode/Crush discovery-root adapters; OpenCode/Crush configuration diagnostics; behavioral evaluation with four test types, measured workspace-diff evidence, reliability across repetitions and regression baselines; layered status/diagnose/repair with bounded budgets; pytest suite and GitHub Actions CI.
+`doctor` inspects candidate files and known configuration issues, while `diagnose` identifies the earliest lifecycle stage for which a supported failure is observed. A stage that has not been probed remains **unverified**, not automatically failed or passed.
 
-**Not implemented/proven:** LLM-driven synthesis/iterative candidate optimizer; executing real Codex/Claude/jcode/Crush/etc. sessions from within UniSkill; universal auto-trigger measurement; semantic grading of agent behavior; platform-wide sandbox guarantees; automated source provenance updates; live compatibility certification across harness/model versions; Windows filesystem installations. These limitations must remain visible in the CLI and must not be represented as verified capabilities.
+`repair` uses bounded attempts and costs (`--max-attempts`, `--max-cost`). Without `--execute`, it reports a proposed action. It cannot manufacture missing runtime evidence or bypass an unsupported diagnosis.
 
-## Project files
+Trust requirements, quarantines, and permission denials are surfaced as blockers. UniSkill does not secretly relax a harness's security policy, grant credentials, or bypass consent to make an installation appear successful. Policy-related repair operations require explicit `--allow-policy` authorization.
 
-- `src/uniskill/`: CLI, contracts, validator, adapters, deployment and evaluation.
-- `skills/universal-skill-engineer/`: agent-facing instruction skill and references.
-- `methodology/`, `sources/`: rationale/authoring guidance, manually curated source provenance.
-- `contracts/`, `evals/`, `examples/`: sample contract, evaluation cases and adapter profiles.
-- `tests/`: isolated behavior and security tests.
+## Project layout
 
-## Design constraints
+| Path | Contents |
+| --- | --- |
+| [`src/uniskill/`](src/uniskill/) | CLI, contracts, adapters, validation, deployment, status, repair, evaluation |
+| [`skills/universal-skill-engineer/`](skills/universal-skill-engineer/) | Agent-facing skill with authoring instructions and references |
+| [`methodology/`](methodology/) and [`sources/`](sources/) | Curated engineering principles and source provenance |
+| [`contracts/`](contracts/) | Example behavioral contracts |
+| [`evals/`](evals/) and [`examples/`](examples/) | Test cases, runner configurations, custom harness mappings |
+| [`tests/`](tests/) | Isolated behavior, correctness, and security tests |
 
-A skill is a reusable behavioral package, **not** a privileged enforcement engine. Deterministic authorization belongs in hooks/host policy/tool guards; live data and authenticated actions belong in controlled tools/MCP integrations. UniSkill does not autonomously disable permissions, edit harness configurations, send network requests, or run installed skill scripts during validation. Source-derived methodology should be revised and tested rather than applied to every installed skill without consent.
+### Development
 
-Licensed Apache-2.0; see `LICENSE`.
+```bash
+python -m pip install -e '.[dev]'
+python -m pytest
+python -m ruff check .
+```
+
+See [`pyproject.toml`](pyproject.toml) for the package version, supported Python versions, and development dependencies.
+
+## Current limitations
+
+UniSkill does **not** currently provide:
+
+- LLM-driven skill synthesis, iterative self-optimization, or semantic grading of arbitrary agent behavior.
+- Built-in live execution of Codex, Claude Code, OpenCode, jcode, Crush, and other harness sessions for end-to-end certification.
+- Universal measurement of automatic skill triggering or compatibility guarantees across harness/model versions.
+- Automatic refresh of third-party source provenance or platform-wide execution sandbox guarantees.
+- Windows filesystem installation support.
+
+A valid package and successful deployment should therefore be interpreted as **necessary setup**, not a certified result. Deterministic authorization still belongs in harness policy, hooks, and tool guards; live data and privileged actions belong in appropriately controlled tools or MCP integrations.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for applicable notices.
 
 ## Acknowledgment and disclaimer
 
-AI inference used during UniSkill's development was provided by [FreeInference (FI)](https://freeinference.org/). UniSkill was developed independently: FI did not direct, commission, review, approve, or endorse the project or the claims made in this README.
+AI inference used during UniSkill's development was provided by [FreeInference (FI)](https://freeinference.org/). **UniSkill was developed independently:** FI did not direct, commission, review, approve, or endorse this project or the claims made in this README.
 
 If you find UniSkill useful, please consider supporting FI. Its service helps expand access to AI tools for people who might otherwise have limited or no access.

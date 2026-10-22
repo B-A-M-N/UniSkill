@@ -618,9 +618,16 @@ class KimiCodeAdapter(HarnessAdapter):
             fields=EXTENDED_FRONTMATTER["kimi-code-cli"])
 
     def skill_metadata(self, skill: str, workspace: Path, home: Path) -> AdapterResult:
-        """Expose manual_only / user_invocable dimensions for Kimi skills."""
-        m = None
-        u = None
+        """Expose manual_only / user_invocable dimensions for Kimi skills.
+
+        Semantics per dimension: True when any discovered copy declares the
+        marker; False when we could read frontmatter and no copy declares it;
+        None (UNKNOWN) only when frontmatter was unreadable/malformed or no
+        copy was found. Readable-but-unmarked frontmatter is real negative
+        evidence and must surface as False, not as UNKNOWN.
+        """
+        m: bool | None = None
+        u: bool | None = None
         for scope in ("project", "user"):
             for root in roots("kimi-code-cli", scope, workspace, home):
                 skill_path = root / skill
@@ -629,13 +636,14 @@ class KimiCodeAdapter(HarnessAdapter):
                 mval = frontmatter_manual_only(skill_path)
                 if mval is True:
                     m = True
-                elif m is None and mval is not False:
-                    m = None  # UNCLASSIFIED propagates
+                elif mval is False and m is None:
+                    m = False  # readable frontmatter, marker absent
+                # mval None (unreadable) never overwrites an existing verdict.
                 uval = frontmatter_user_invocable(skill_path)
                 if uval is True:
                     u = True
-                elif u is None and uval is not False:
-                    u = None
+                elif uval is False and u is None:
+                    u = False
         return AdapterResult(
             UNVERIFIED,
             "Read-only frontmatter inspection; no runtime probe",

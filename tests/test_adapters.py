@@ -57,15 +57,16 @@ def test_crush_crushrc_disable_and_metadata(tmp_path, monkeypatch):
     root, home = tmp_path / "repo", tmp_path / "home"
     home.mkdir()
     root.mkdir()
-    (root / "crushrc").write_text("option disable-skill locked-skill\n")
-    (root / ".crush").mkdir()
-    (root / ".crush/crushrc").write_text("disable-skill-model manual-skill\n")
+    # crush.json disables locked-skill
+    (root / "crush.json").write_text(json.dumps({"options": {"disabled_skills": ["locked-skill"]}}))
+    # disable-skill (documented, NOT disable-skill-model) in crushrc disables manual-skill
+    (root / "crushrc").write_text("option disable-skill manual-skill\n")
     ad = get_adapter("crush")
     locked = ad.skill_metadata("locked-skill", root, home)
     assert locked["metadata_class"] == "DISABLED"
     manual = ad.skill_metadata("manual-skill", root, home)
-    assert manual["metadata_class"] == "MANUAL_ONLY"
-    assert manual["manual_only"] is True
+    assert manual["metadata_class"] == "DISABLED"
+    assert manual["disabled"] is True
     normal = ad.skill_metadata("other-skill", root, home)
     assert normal["metadata_class"] == "MODEL_INVOCABLE_CANDIDATE"
 
@@ -144,7 +145,15 @@ def test_kimi_invoke_and_adapt(tmp_path):
     assert inv["native"] is True
     assert inv["state"] == UNVERIFIED
     ad_pack = ad.adapt(tmp_path)
-    assert "name" in ad_pack["fields"] and "version" in ad_pack["fields"]
+    # Documented Kimi Code CLI extended fields (kimi.com/code/docs, 2026-10-21)
+    assert "name" in ad_pack["fields"]
+    assert "type" in ad_pack["fields"]
+    assert "whenToUse" in ad_pack["fields"]
+    assert "disableModelInvocation" in ad_pack["fields"]
+    assert "arguments" in ad_pack["fields"]
+    # Fabricated fields must NOT be present
+    assert "version" not in ad_pack["fields"]
+    assert "metadata" not in ad_pack["fields"]
 
 
 def test_pi_native_locations(tmp_path):

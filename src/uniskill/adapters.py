@@ -4,12 +4,20 @@ Layered on top of harnesses.py WITHOUT changing its pinned behavior. Every
 operation returns a structured result whose explicit evidence state must never
 overclaim: filesystem presence is not discovery, a binary is not a runtime, and
 a profile that only knows copy targets is INSTALL_ONLY.
+
+EXTENDED_FRONTMATTER and manual-only detection are grounded in documented
+vendor behaviour (2026-10-21): kimi.com/code/docs skills, pi.dev/docs/latest,
+hermes-agent.nousresearch.com/docs, charmbracelet/crush SKILL.md.
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
+from typing import Tuple
+
+import yaml
 
 from .common import UniSkillError
 from .harnesses import HARNESSES, Harness, load_registry, roots, crush_diagnostics
@@ -37,12 +45,117 @@ SUPPORT_CLASS_OVERRIDES = {
 
 # Extended frontmatter fields some harnesses accept (documented; adding them to
 # a harness that ignores them is harmless, but we only emit where documented).
+#
+# kimi-code-cli: kimi.com/code/docs skills page (2026-10-21). The documented
+# extended fields are type, whenToUse, disableModelInvocation, arguments. The
+# canonical base fields "name" and "description" are always present. "version"
+# and "metadata" are NOT documented as Kimi Code CLI extended fields and must
+# not be emitted as such.
 EXTENDED_FRONTMATTER = {
-    "kimi-code-cli": ["name", "description", "version", "metadata"],
+    "kimi-code-cli": ["name", "description", "type", "whenToUse",
+                       "disableModelInvocation", "arguments"],
     "claude-code": ["name", "description", "metadata"],
 }
 
 _KIMI_CODE_HOME_DEFAULT = ".kimi-code"
+
+
+# ---------------------------------------------------------------------------
+# Shared frontmatter helpers (Fix 4)
+# ---------------------------------------------------------------------------
+# These helpers parse a SKILL.md frontmatter block and return classification
+# results for manual-only and user-invocable dimensions.  All three result
+# values are explicit: True, False, or UNKNOWN.
+#
+# - manual_only: True when the frontmatter contains disable-model-invocation:
+#   true (kimi-style camelCase disableModelInvocation, crush-style
+#   disable-model-invocation, or snake_case disable_model_invocation).
+# - user_invocable: True when the frontmatter contains user-invocable: true
+#   (only Crush exposes this dimension; set to False for all other harnesses).
+# ---------------------------------------------------------------------------
+
+
+def frontmatter_manual_only(skill_dir: Path) -> bool | False | None:
+    """Return True/False/UNKNOWN whether a skill's frontmatter marks it manual-only.
+
+    Documented across Kimi (disableModelInvocation), Crush (disable-model-invocation),
+    Pi (disable-model-invocation).  Accepts camelCase, kebab-case, and snake_case
+    aliases for the YAML key.
+
+    Returns:
+        True  – frontmatter declares manual-only (disabled model invocation)
+        False – frontmatter exists but does not declare it
+        None  – frontmatter is unreadable, malformed, or file missing
+    """
+    fm = _load_frontmatter(skill_dir)
+    if fm is None:
+        return None
+    for key in ("disable-model-invocation", "disableModelInvocation",
+                "disable_model_invocation"):
+        if fm.get(key) is True:
+            return True
+    return False
+
+
+def frontmatter_user_invocable(skill_dir: Path) -> bool | False | None:
+    """Return True/False/UNKNOWN whether a skill is user-invocable (slash command).
+
+    Only Crush documents a `user-invocable` frontmatter marker.
+    Returns False for all other harnesses.
+
+    Returns:
+        True  – frontmatter declares user-invocable: true
+        False – frontmatter exists but does not declare it
+        None  – frontmatter is unreadable or missing
+    """
+    fm = _load_frontmatter(skill_dir)
+    if fm is None:
+        return None
+    for key in ("user-invocable", "userInvocable", "user_invocable"):
+        if fm.get(key) is True:
+            return True
+    return False
+
+
+def _load_frontmatter(skill_dir: Path) -> dict | None:
+    """Load YAML frontmatter from a SKILL.md, or None on failure."""
+    path = Path(skill_dir) / "SKILL.md"
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z", raw, re.DOTALL)
+    if not match:
+        return None
+    try:
+        fm = yaml.safe_load(match.group(1))
+        if not isinstance(fm, dict):
+            return None
+        return fm
+    except yaml.YAMLError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pi agent-dir resolution (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+def _pi_agent_dir(home: Path) -> Path:
+    """Resolve Pi agent directory respecting PI_CODING_AGENT_DIR.
+
+    The Pi agent reads skills from <agent-dir>/skills where agent-dir defaults
+    to ~/.pi/agent.  The environment variable PI_CODING_AGENT_DIR overrides the
+    default (mirroring how KimiCodeAdapter resolves KIMI_CODE_HOME).
+
+    Returns the resolved agent-dir path (not the skills subdirectory).
+    """
+    env = os.environ.get("PI_CODING_AGENT_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path(home) / ".pi" / "agent"
 
 
 def _registry(registry=None) -> dict[str, Harness]:
@@ -271,48 +384,103 @@ class CrushAdapter(HarnessAdapter):
     def skill_metadata(self, skill: str, workspace: Path, home: Path) -> AdapterResult:
         """Distinguish MANUAL-ONLY vs MODEL-INVOCABLE metadata for a skill.
 
-        Crush docs: a skill that is disabled is neither; a skill whose metadata
-        marks it manual-only is excluded from model invocation.
+        Documented Crush behaviour (2026-10-21; charmbracelet/crush SKILL.md):
+        - "disable-model-invocation: true" (or camelCase disableModelInvocation,
+          snake_case disable_model_invocation) marks a skill as user-only /
+          manual-only — hidden from the model's skill list but still manually
+          invocable by a human.
+        - "user-invocable: true" exposes the skill as a slash command
+          (user:skill-name for global, project:skill-name for project).
+        - Disabling at the crushrc/crush.json level (disabled_skills list or
+          "option disable-skill <name>" line) classifies as DISABLED and is
+          orthogonal to the frontmatter markers.
+
+        Crush also accepts a line-oriented crushrc config preferred over the
+        legacy crush.json — crushrc wins on conflict (deep-merged).  Valid
+        discovery paths for crushrc files are:
+          .crushrc, crushrc, .crush/crushrc, crush.json, .crush/crush.json
+          + the user-level ~/.config/crush/crushrc and crush.json.
+
+        Classification states:
+          DISABLED           — config-level disable (crushrc / crush.json)
+          MANUAL_ONLY        — frontmatter disable-model-invocation: true
+          MODEL_INVOCABLE_CANDIDATE — neither marker present
+          UNCLASSIFIED       — frontmatter unreadable / missing (fail-closed)
+
+        CRITICAL: never claim MODEL_INVOCABLE_CANDIDATE when we cannot read or
+        parse the frontmatter; report UNCLASSIFIED instead.
         """
         policy = crush_diagnostics(skill, workspace, home)
         disabled = bool(policy)
-        # Manual-only marker: Crush honors a `manual-only: true` frontmatter
-        # field (and crushrc `disable-skill-model` directives).
+
+        # Collect manual-only / user-invocable from every SKILL.md we can find.
         manual_only = False
+        user_invocable = False
+        classify_reason = "no_frontmatter"  # default if nothing found
+        saw_skill_dir = False  # track if we found a skill directory at all
+
         for scope in ("project", "user"):
             for root in roots("crush", scope, workspace, home):
-                path = root / skill / "SKILL.md"
-                if not path.is_file():
+                skill_path = root / skill
+                skill_md = skill_path / "SKILL.md"
+                if skill_path.is_dir():
+                    saw_skill_dir = True
+                if not skill_md.is_file():
                     continue
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                if "manual-only: true" in text or "manual_only: true" in text:
+                m = frontmatter_manual_only(skill_path)
+                if m is True:
                     manual_only = True
-        for path in (workspace / "crushrc", workspace / ".crush/crushrc",
-                     home / ".config/crush/crushrc"):
+                    classify_reason = "frontmatter"
+                elif m is None:
+                    classify_reason = "unreadable"
+                u = frontmatter_user_invocable(skill_path)
+                if u is True:
+                    user_invocable = True
+                    classify_reason = "frontmatter"
+                elif u is None and classify_reason == "no_frontmatter":
+                    classify_reason = "unreadable"
+
+        # Check crushrc/crush.json disable directives (fix: add .crushrc).
+        # crushrc is the line-oriented config preferred over legacy crush.json.
+        crushrc_paths = (
+            workspace / ".crushrc",              # leading-dot path (was missing!)
+            workspace / "crushrc",
+            workspace / ".crush" / "crushrc",
+            home / ".config" / "crush" / "crushrc",
+        )
+        for path in crushrc_paths:
             if not path.is_file():
                 continue
             try:
-                import re
                 for line in path.read_text(encoding="utf-8").splitlines():
-                    if re.match(r"^\s*(?:option\s+)?disable-skill-model\s+" +
-                                re.escape(skill) + r"\s*$", line):
-                        manual_only = True
+                    if re.match(
+                        r"^\s*(?:option\s+)?"
+                        r"disable-skill\s+"
+                        + re.escape(skill) + r"\s*$",
+                        line,
+                    ):
+                        disabled = True
             except (UnicodeError, OSError):
                 pass
+
         if disabled:
             state = "DISABLED"
         elif manual_only:
             state = "MANUAL_ONLY"
+        elif classify_reason != "no_frontmatter" or saw_skill_dir:
+            # We found a frontmatter that was unreadable, or we found a skill
+            # directory without a parseable SKILL.md — fail closed.
+            state = "UNCLASSIFIED"
         else:
             state = "MODEL_INVOCABLE_CANDIDATE"
+
         return AdapterResult(
             UNVERIFIED if state != "DISABLED" else FAILED,
             None if state != "DISABLED" else "Skill is disabled by Crush configuration",
             metadata_class=state, policy_diagnostics=policy,
-            manual_only=manual_only, disabled=disabled,
+            manual_only=manual_only or None,
+            user_invocable=user_invocable or None,
+            disabled=disabled,
             note="Classification is static metadata inspection, not proof the "
                  "Crush model can or will invoke the skill")
 
@@ -449,18 +617,53 @@ class KimiCodeAdapter(HarnessAdapter):
             packaging="frontmatter_fields",
             fields=EXTENDED_FRONTMATTER["kimi-code-cli"])
 
+    def skill_metadata(self, skill: str, workspace: Path, home: Path) -> AdapterResult:
+        """Expose manual_only / user_invocable dimensions for Kimi skills."""
+        m = None
+        u = None
+        for scope in ("project", "user"):
+            for root in roots("kimi-code-cli", scope, workspace, home):
+                skill_path = root / skill
+                if not (skill_path / "SKILL.md").is_file():
+                    continue
+                mval = frontmatter_manual_only(skill_path)
+                if mval is True:
+                    m = True
+                elif m is None and mval is not False:
+                    m = None  # UNCLASSIFIED propagates
+                uval = frontmatter_user_invocable(skill_path)
+                if uval is True:
+                    u = True
+                elif u is None and uval is not False:
+                    u = None
+        return AdapterResult(
+            UNVERIFIED,
+            "Read-only frontmatter inspection; no runtime probe",
+            manual_only=m, user_invocable=u, read_only=True)
+
 
 class PiAdapter(HarnessAdapter):
-    """Pi: native .pi/skills (project) and .pi/agent/skills (global)."""
+    """Pi: native .pi/skills (project) and <agent-dir>/skills (global).
+
+    The agent-dir defaults to ~/.pi/agent but is overridable via the
+    PI_CODING_AGENT_DIR environment variable (mirroring how KimiCodeAdapter
+    resolves KIMI_CODE_HOME).
+    """
 
     harness_name = "pi"
+
+    @staticmethod
+    def pi_agent_dir(home: Path) -> Path:
+        """Resolve the Pi agent directory respecting PI_CODING_AGENT_DIR."""
+        return _pi_agent_dir(home)
 
     def roots(self, scope, workspace, home):
         if scope == "project":
             return [(Path(workspace) / r).resolve(strict=False)
                     for r in (".agents/skills", ".pi/skills")]
-        return [(Path(home) / r).resolve(strict=False)
-                for r in (".agents/skills", ".pi/agent/skills")]
+        agent_dir = self.pi_agent_dir(home)
+        return [(agent_dir / "skills").resolve(strict=False),
+                (Path(home) / ".agents/skills").resolve(strict=False)]
 
 
 class CustomAdapter(HarnessAdapter):

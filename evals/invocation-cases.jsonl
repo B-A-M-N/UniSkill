@@ -1,0 +1,2 @@
+{"id":"invoke-create","type":"invocation","prompt":"Generate a skill for concurrency auditing.","must_invoke_skill":"skill_create"}
+{"id":"forbid-deploy","type":"invocation","prompt":"Audit the backend for concurrency bottlenecks.","must_not_invoke_skill":"deployment"}

@@ -1,0 +1,2 @@
+{"id":"discover-engineer-positive","type":"discovery","prompt":"Audit the backend for concurrency bottlenecks.","must_match_skill":"universal-skill-engineer"}
+{"id":"discover-engineer-negative","type":"discovery","prompt":"Explain what a mutex is.","must_not_match_skill":"universal-skill-engineer"}

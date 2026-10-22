@@ -1,0 +1,2 @@
+{"id":"auto-trigger-engineer","type":"selection","prompt":"Audit the backend for concurrency bottlenecks.","must_select_skill":"universal-skill-engineer"}
+{"id":"negative-selection","type":"selection","prompt":"Explain what a mutex is.","must_not_select_skill":"universal-skill-engineer"}

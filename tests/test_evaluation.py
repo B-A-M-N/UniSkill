@@ -6,10 +6,10 @@ regression/baseline, backward compatibility, and evidence labelling.
 from __future__ import annotations
 from pathlib import Path
 import json
-import os
 import sys
 import textwrap
 import pytest
+import hashlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -25,6 +25,7 @@ from uniskill.evaluation import (
     snapshot_workspace,
     baseline_save,
     baseline_load,
+    _resolve_workspace,
 )
 
 
@@ -35,9 +36,8 @@ from uniskill.evaluation import (
 def _write_runner(tmp_path, response_fn, name="runner.py"):
     """Create a small Python runner script.
 
-    *response_fn* is a string of Python code for the ``main()`` function body
-    that returns a dict (or prints JSON). The runner reads the prompt from
-    stdin.
+    *response_fn* is a string of Python code that reads stdin and prints JSON.
+    The runner's cwd is *tmp_path* (the runner JSON's "cwd" field).
     """
     runner_py = tmp_path / name
     runner_py.write_text(textwrap.dedent(response_fn), encoding="utf-8")
@@ -55,7 +55,7 @@ def _write_cases_jsonl(tmp_path, cases, name="cases.jsonl"):
 
 
 def _write_runner_json(tmp_path, runner_path, output="json", name="runner.json"):
-    """Write a runner config JSON."""
+    """Write a runner config JSON.  cwd defaults to tmp_path (the runner's cwd)."""
     config = {
         "argv": ["python", str(runner_path)],
         "cwd": str(tmp_path),
@@ -73,21 +73,47 @@ def _assert_all_pass(suite):
     assert suite["state"] == PASS, f"Expected PASS but got {suite['state']}: {[c['state'] for c in suite['cases']]}"
 
 
-def _assert_all_fail(suite):
-    """Assert a behavioral suite result states FAILED overall."""
-    assert suite["state"] == FAILED
-
-
-def _assert_unverified(suite):
-    assert suite["state"] == UNVERIFIED
-
-
 # ---------------------------------------------------------------------------
 # Test: TEST_TYPES constant
 # ---------------------------------------------------------------------------
 
 def test_test_types_constant():
     assert TEST_TYPES == ("discovery", "invocation", "selection", "functionality", "regression")
+
+
+# ---------------------------------------------------------------------------
+# P1-A: _resolve_workspace — single-tree enforcement
+# ---------------------------------------------------------------------------
+
+def test_resolve_workspace_none_uses_runner_cwd(tmp_path):
+    """When workspace is None, the measured tree IS the runner's cwd."""
+    result = _resolve_workspace(None, tmp_path)
+    assert result == tmp_path.resolve()
+
+
+def test_resolve_workspace_same_dir(tmp_path):
+    """When workspace resolves to the same dir as runner cwd, it's accepted."""
+    # Using tmp_path directly means workspace == runner cwd
+    result = _resolve_workspace(tmp_path, tmp_path)
+    assert result == tmp_path.resolve()
+
+
+def test_resolve_workspace_subdir_raises(tmp_path):
+    """A subdirectory is NOT the same as parent; raises UniSkillError."""
+    from uniskill.common import UniSkillError
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    with pytest.raises(UniSkillError, match="different directories"):
+        _resolve_workspace(sub, tmp_path)
+
+
+def test_resolve_workspace_different_dirs_raises(tmp_path):
+    """When workspace resolves to a DIFFERENT directory, raises UniSkillError."""
+    from uniskill.common import UniSkillError
+    ws = tmp_path / "other"
+    ws.mkdir()
+    with pytest.raises(UniSkillError, match="different directories"):
+        _resolve_workspace(ws, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -329,14 +355,9 @@ print(json.dumps({"response":"done","tool_calls":["search-concurrency"]}))
 def test_functionality_catches_missing_artifact_via_workspace_diff(tmp_path):
     """The money test: runner says success, diff shows no artifact, evaluator FAILS.
 
-    The runner self-reports a successful response, but the required artifact
-    (file) was not created in the workspace. The measured workspace diff
-    catches this.
+    With single-tree semantics: runner creates artifact in its cwd (tmp_path),
+    so if it DOESN'T create the artifact, measured tree diff will show it missing.
     """
-    # Create a workspace dir
-    ws = tmp_path / "workspace"
-    ws.mkdir()
-
     # Runner that reports success but does NOT create the required file
     runner_py = _write_runner(tmp_path, """
 import sys,json
@@ -351,7 +372,8 @@ print(json.dumps({"response":"Artifact created successfully","tool_calls":["writ
          "allowed_diff_prefix": [],  # no allowed changes
         },
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    # No workspace param: measured tree = runner's cwd (tmp_path) which is empty
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     row = suite["cases"][0]
     assert row["state"] == FAILED
     assert row["case_type"] == "functionality"
@@ -363,15 +385,12 @@ print(json.dumps({"response":"Artifact created successfully","tool_calls":["writ
 def test_functionality_detects_forbidden_side_effect(tmp_path):
     """Runner creates a file outside the allowed prefix → FAIL via measured diff,
     even though runner-claimed tool_calls are clean."""
-    ws = tmp_path / "workspace2"
-    ws.mkdir()
-
-    # Runner claims only allowed tools, but creates an unauthorized file
+    # Runner creates a forbidden file in its own cwd
     runner_py = _write_runner(tmp_path, """
 import sys,json
-import os
-# Create a forbidden file in workspace
-(Path(sys.argv[1]) / "workspace2" / "unauthorized/deleted.txt").write_text("deleted content")
+from pathlib import Path
+(Path("unauthorized")).mkdir(exist_ok=True)
+(Path("unauthorized") / "deleted.txt").write_text("deleted content")
 print(json.dumps({"response":"Clean operation","tool_calls":["read-file"]}))
 """, name="runner_side.py")
     runner_cfg = _write_runner_json(tmp_path, runner_py)
@@ -381,7 +400,7 @@ print(json.dumps({"response":"Clean operation","tool_calls":["read-file"]}))
          "allowed_diff_prefix": ["output/"],  # only output/ is allowed
         },
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     row = suite["cases"][0]
     assert row["state"] == FAILED
     assert any("Forbidden side effect" in p for p in row["problems"])
@@ -389,14 +408,10 @@ print(json.dumps({"response":"Clean operation","tool_calls":["read-file"]}))
 
 
 def test_functionality_passes_with_created_artifact(tmp_path):
-    """Runner creates the required artifact → PASS."""
-    ws = tmp_path / "workspace3"
-    ws.mkdir()
-
+    """Runner creates the required artifact in its cwd → PASS."""
     runner_py = _write_runner(tmp_path, """
 import sys,json
 from pathlib import Path
-# Create the required artifact in the runner's cwd (tmp_path)
 (output := Path("output")).mkdir(exist_ok=True)
 (output / "report.txt").write_text("Analysis complete")
 print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
@@ -406,13 +421,60 @@ print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
         {"id": "func-pass", "type": "functionality",
          "prompt": "test",
          "required_artifacts": ["output/report.txt"],
-         "allowed_diff_prefix": [],
+         "allowed_diff_prefix": ["output/"],
         },
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    # Single measured tree: runner cwd (tmp_path)
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     row = suite["cases"][0]
     assert row["state"] == PASS
     assert row["evidence_type"] == MEASURED
+
+
+# ---------------------------------------------------------------------------
+# P1-B: expected_exit_code threading — exit code 0 with expected 0 must PASS
+# ---------------------------------------------------------------------------
+
+def test_expected_exit_code_zero_passes(tmp_path):
+    """functionality case with expected_exit_code 0 and a runner that exits 0 must PASS."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+print(json.dumps({"response":"OK","tool_calls":[]}))
+sys.exit(0)
+""")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "exit-zero", "type": "functionality",
+         "prompt": "test",
+         "expected_exit_code": 0,
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == PASS
+    assert not any("exit code" in p.lower() for p in row["problems"]), \
+        f"Unexpected exit-code problem in: {row['problems']}"
+
+
+def test_expected_exit_code_nonzero_fails(tmp_path):
+    """functionality case with expected_exit_code 0 and a runner that exits 3 must FAIL."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+print(json.dumps({"response":"OK","tool_calls":[]}))
+sys.exit(3)
+""")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "exit-three", "type": "functionality",
+         "prompt": "test",
+         "expected_exit_code": 0,
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    assert any("exit code" in p.lower() for p in row["problems"]), \
+        f"Expected exit-code problem missing; problems: {row['problems']}"
 
 
 # ---------------------------------------------------------------------------
@@ -421,10 +483,7 @@ print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
 
 def test_regression_baseline_saved_from_passing_runs(tmp_path):
     """Baseline saved from passing runs; a later failing case is REGRESSION."""
-    ws = tmp_path / "ws_reg"
-    ws.mkdir()
-
-    # First: create a baseline with a passing case
+    # Runner that passes
     runner_py = _write_runner(tmp_path, """
 import sys,json
 print(json.dumps({"response":"SUCCESS: all checks passed","tool_calls":["analyze"]}))
@@ -436,7 +495,7 @@ print(json.dumps({"response":"SUCCESS: all checks passed","tool_calls":["analyze
         {"id": "reg-case", "type": "functionality",
          "prompt": "test", "must_include": ["all checks passed"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases_pass), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases_pass), runner_cfg, 1)
     assert suite["cases"][0]["state"] == PASS
 
     # Save baseline
@@ -461,7 +520,7 @@ print(json.dumps({"response":"FAILURE: regression detected","tool_calls":[]}))
          "prompt": "test", "must_include": ["all checks passed"]},
     ])
     suite2 = run_behavioral_suite(load_cases(cases_fail), runner_cfg_fail, 1,
-                                  workspace=str(ws), baseline_path=bl_path)
+                                  baseline_path=bl_path)
     row = suite2["cases"][0]
     assert row["state"] == REGRESSION
     assert row["case_type"] == "regression"
@@ -469,8 +528,6 @@ print(json.dumps({"response":"FAILURE: regression detected","tool_calls":[]}))
 
 def test_regression_no_baseline_is_unverified(tmp_path):
     """A regression case with no baseline is UNVERIFIED."""
-    ws = tmp_path / "ws_reg2"
-    ws.mkdir()
     runner_py = _write_runner(tmp_path, """
 import sys,json
 print(json.dumps({"response":"OK","tool_calls":[]}))
@@ -482,21 +539,18 @@ print(json.dumps({"response":"OK","tool_calls":[]}))
     ])
     bl_path = tmp_path / "baselines" / "nonexistent.json"
     suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1,
-                                  workspace=str(ws), baseline_path=bl_path)
+                                  baseline_path=bl_path)
     row = suite["cases"][0]
     assert row["state"] == UNVERIFIED
 
 
 def test_regression_case_not_in_baseline_not_reported_as_regression(tmp_path):
     """A case never in the baseline is UNVERIFIED, not REGRESSION."""
-    ws = tmp_path / "ws_reg3"
-    ws.mkdir()
     runner_py = _write_runner(tmp_path, """
 import sys,json
 print(json.dumps({"response":"OK","tool_calls":[]}))
 """)
     runner_cfg = _write_runner_json(tmp_path, runner_py)
-    # Case with id "unknown-case" — not in baseline
     cases = _write_cases_jsonl(tmp_path, [
         {"id": "unknown-case", "type": "regression",
          "prompt": "test", "must_include": ["OK"]},
@@ -505,9 +559,207 @@ print(json.dumps({"response":"OK","tool_calls":[]}))
     bl_path = tmp_path / "baselines" / "known.json"
     baseline_save(bl_data, bl_path)
     suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1,
-                                  workspace=str(ws), baseline_path=bl_path)
+                                  baseline_path=bl_path)
     row = suite["cases"][0]
     assert row["state"] == UNVERIFIED
+
+
+# ---------------------------------------------------------------------------
+# P2-D: must_contain / content_digest enforcement
+# ---------------------------------------------------------------------------
+
+def test_required_artifact_must_contain_passes(tmp_path):
+    """Required artifact with must_contain substring passes when content matches."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("output")).mkdir(exist_ok=True)
+(Path("output") / "report.txt").write_text("Analysis complete and verified")
+print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
+""", name="runner_mc.py")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "mc-pass", "type": "functionality",
+         "prompt": "test",
+         "required_artifacts": [
+             {"path": "output/report.txt", "must_contain": ["Analysis complete"]}
+         ],
+         "allowed_diff_prefix": ["output/"],
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == PASS
+
+
+def test_required_artifact_must_contain_fails(tmp_path):
+    """Required artifact with must_contain fails when content does NOT match."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("output")).mkdir(exist_ok=True)
+(Path("output") / "report.txt").write_text("Nothing interesting here")
+print(json.dumps({"response":"Done","tool_calls":["write-file"]}))
+""", name="runner_mc_fail.py")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "mc-fail", "type": "functionality",
+         "prompt": "test",
+         "required_artifacts": [
+             {"path": "output/report.txt", "must_contain": ["Analysis complete"]}
+         ],
+         "allowed_diff_prefix": [],
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    assert any("missing required content" in p for p in row["problems"]), \
+        f"Expected content-mismatch problem missing; problems: {row['problems']}"
+
+
+def test_required_artifact_content_digest_passes(tmp_path):
+    """Required artifact with content_digest passes when sha256 matches."""
+    content = "hello world"
+    digest = hashlib.sha256(content.encode()).hexdigest()
+
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("output")).mkdir(exist_ok=True)
+(Path("output") / "report.txt").write_text("hello world")
+print(json.dumps({"response":"Done","tool_calls":[]}))
+""", name="runner_cd.py")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "cd-pass", "type": "functionality",
+         "prompt": "test",
+         "required_artifacts": [
+             {"path": "output/report.txt", "content_digest": digest}
+         ],
+         "allowed_diff_prefix": ["output/"],
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == PASS
+
+
+def test_required_artifact_content_digest_fails(tmp_path):
+    """Required artifact with content_digest fails when sha256 does NOT match."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("output")).mkdir(exist_ok=True)
+(Path("output") / "report.txt").write_text("wrong content")
+print(json.dumps({"response":"Done","tool_calls":[]}))
+""", name="runner_cd_fail.py")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    # Pass a wrong digest
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "cd-fail", "type": "functionality",
+         "prompt": "test",
+         "required_artifacts": [
+             {"path": "output/report.txt", "content_digest": "deadbeef" * 8}
+         ],
+         "allowed_diff_prefix": [],
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    assert any("content-digest mismatch" in p for p in row["problems"]), \
+        f"Expected digest-mismatch problem missing; problems: {row['problems']}"
+
+
+# ---------------------------------------------------------------------------
+# P2-E: allowed_diff_prefix=[] and forbidden artifacts
+# ---------------------------------------------------------------------------
+
+def test_allowed_diff_prefix_empty_rejects_changes(tmp_path):
+    """allowed_diff_prefix [] (empty list) rejects any workspace change."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("unwanted")).write_text("nope")
+print(json.dumps({"response":"OK","tool_calls":[]}))
+""")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "no-changes", "type": "functionality",
+         "prompt": "test",
+         "allowed_diff_prefix": [],  # nothing allowed
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    assert any("Forbidden side effect" in p for p in row["problems"])
+
+
+def test_allowed_diff_prefix_empty_allows_no_changes(tmp_path):
+    """allowed_diff_prefix [] with a runner that writes nothing → PASS."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+# Does NOT write any file
+print(json.dumps({"response":"OK","tool_calls":[]}))
+""")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "no-write", "type": "functionality",
+         "prompt": "test",
+         "allowed_diff_prefix": [],  # nothing allowed, runner writes nothing
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == PASS
+
+
+def test_forbidden_artifacts_with_absolute_prefix(tmp_path):
+    """Forbidden artifact paths with absolute prefixes match workspace-absolute resolution."""
+    runner_py = _write_runner(tmp_path, """
+import sys,json
+from pathlib import Path
+(Path("etc_foo")).write_text("bad file")
+print(json.dumps({"response":"OK","tool_calls":[]}))
+""")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "forbidden-abs", "type": "functionality",
+         "prompt": "test",
+         "forbidden_artifacts": ["/etc_foo"],  # absolute prefix
+        },
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
+    row = suite["cases"][0]
+    assert row["state"] == FAILED
+    assert any("Forbidden artifact" in p for p in row["problems"]), \
+        f"Expected forbidden artifact problem; problems: {row['problems']}"
+
+
+# ---------------------------------------------------------------------------
+# P2-F: Fail-open snapshot — snapshot failure must not silently pass
+# ---------------------------------------------------------------------------
+
+def test_snapshot_failure_is_fail_not_pass(tmp_path):
+    """If snapshot fails mid-run, the case must FAIL, not PASS with empty diff."""
+    # We can't easily break snapshot_workspace in a test, but we verify
+    # that the evaluator checks the measured_problems list for snapshot failures.
+    # Since _run_single_case calls snapshot_workspace(measured_tree) and
+    # any exception is appended to problems, a snapshot failure produces a FAILED case.
+    # This test is structural: verify that a measured_problems entry propagates.
+    from uniskill.evaluation import _eval_functionality, MEASURED, FAILED, PASS
+    problems = ["snapshot failure: directory vanished"]
+    state, problems_out, etype, detail = _eval_functionality(
+        {"id": "snap-fail", "type": "functionality", "prompt": "test"},
+        runner_output="OK", tool_calls=[],
+        workspace_diff={"created": [], "modified": [], "deleted": []},
+        measured_tree=None, timed_out=False, actual_exit_code=0,
+        measured_problems=problems,
+    )
+    assert state == FAILED
+    assert any("snapshot failure" in p for p in problems_out)
 
 
 # ---------------------------------------------------------------------------
@@ -515,10 +767,7 @@ print(json.dumps({"response":"OK","tool_calls":[]}))
 # ---------------------------------------------------------------------------
 
 def test_reliability_flaky_detects_mixed_results(tmp_path):
-    """3 repetitions with an intermittent runner → reported as FLAKY with correct pass_rate."""
-    ws = tmp_path / "ws_rel"
-    ws.mkdir()
-
+    """3 repetitions with an intermittent runner → reported as TOO_FEW with correct pass_rate."""
     # Runner that succeeds on 1st, fails on 2nd, succeeds on 3rd
     # Uses the tmp_path directory (passed as cwd) to store the counter
     runner_py = _write_runner(tmp_path, """
@@ -539,7 +788,7 @@ else:
         {"id": "flaky-case", "type": "functionality",
          "prompt": "test", "must_include": ["OK"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 3, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 3)
     # Check per-case reliability
     rel = suite["reliability"]["flaky-case"]
     assert rel["trials"] == 3
@@ -551,9 +800,6 @@ else:
 
 def test_reliability_n_ge_5_passes_all(tmp_path):
     """5+ trials all pass → PASS verdict with Wilson CI."""
-    ws = tmp_path / "ws_rel2"
-    ws.mkdir()
-
     runner_py = _write_runner(tmp_path, """
 import sys,json
 print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
@@ -563,7 +809,7 @@ print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
         {"id": "reliable-case", "type": "functionality",
          "prompt": "test", "must_include": ["OK"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 5, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 5)
     rel = suite["reliability"]["reliable-case"]
     assert rel["trials"] == 5
     assert rel["passes"] == 5
@@ -574,9 +820,6 @@ print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
 
 def test_reliability_n_ge_5_all_fail(tmp_path):
     """5+ trials all fail → FAIL verdict."""
-    ws = tmp_path / "ws_rel3"
-    ws.mkdir()
-
     runner_py = _write_runner(tmp_path, """
 import sys,json
 print(json.dumps({"response":"NO SUCCESS HERE","tool_calls":[]}))
@@ -586,10 +829,29 @@ print(json.dumps({"response":"NO SUCCESS HERE","tool_calls":[]}))
         {"id": "fail-case", "type": "functionality",
          "prompt": "test", "must_include": ["ALL CHECKS PASSED"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 5, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 5)
     rel = suite["reliability"]["fail-case"]
     assert rel["verdict"] == "FAIL"
     assert "all 5" in rel["confidence"].lower()
+
+
+def test_reliability_all_timeout_verdict(tmp_path):
+    """All-TIMEOUT (n>=5) reports verdict TIMEOUT, not FAIL."""
+    runner_py = _write_runner(tmp_path, """
+import time,sys,json
+time.sleep(10)
+print(json.dumps({"response":"never","tool_calls":[]}))
+""", name="runner_slow_rel.py")
+    runner_cfg = _write_runner_json(tmp_path, runner_py)
+    cases = _write_cases_jsonl(tmp_path, [
+        {"id": "timeout-case", "type": "functionality",
+         "prompt": "test"},
+    ])
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 5)
+    rel = suite["reliability"]["timeout-case"]
+    assert rel["trials"] == 5
+    assert rel["verdict"] == "TIMEOUT"
+    assert "timed out" in rel["confidence"].lower()
 
 
 def test_reliability_function_direct(tmp_path):
@@ -626,9 +888,6 @@ def test_reliability_flaky_direct(tmp_path):
 
 def test_timeout_is_own_state(tmp_path):
     """Timeout is reported as its own state, not a generic failure."""
-    ws = tmp_path / "ws_to"
-    ws.mkdir()
-
     # Runner that sleeps longer than the timeout
     runner_py = _write_runner(tmp_path, """
 import time,sys,json
@@ -640,7 +899,7 @@ print(json.dumps({"response":"never","tool_calls":[]}))
         {"id": "timeout-case", "type": "functionality",
          "prompt": "test"},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     row = suite["cases"][0]
     assert row["timed_out"] is True
     assert row["state"] == TIMEOUT
@@ -652,9 +911,6 @@ print(json.dumps({"response":"never","tool_calls":[]}))
 
 def test_no_implicit_execution(tmp_path):
     """run_behavioral_suite without a runner (missing runner file) returns UNVERIFIED."""
-    ws = tmp_path / "ws_noexec"
-    ws.mkdir()
-
     cases = _write_cases_jsonl(tmp_path, [
         {"id": "no-exec", "type": "functionality",
          "prompt": "test"},
@@ -667,8 +923,6 @@ def test_no_implicit_execution(tmp_path):
 
 def test_run_behavioral_suite_returns_unverified_when_no_runner_matches(tmp_path):
     """When there's a runner but it fails completely, the suite doesn't falsely PASS."""
-    ws = tmp_path / "ws_nomatch"
-    ws.mkdir()
 
     runner_py = _write_runner(tmp_path, """
 import sys,json
@@ -679,7 +933,7 @@ print(json.dumps({"response":"not matching anything","tool_calls":[]}))
         {"id": "nomatch", "type": "functionality",
          "prompt": "test", "must_include": ["definitely-not-here"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     # Suite should not PASS
     assert suite["state"] != PASS
 
@@ -690,8 +944,6 @@ print(json.dumps({"response":"not matching anything","tool_calls":[]}))
 
 def test_runner_asserted_only_cases_labeled_in_aggregate(tmp_path):
     """Runner-asserted-only cases (discovery/invocation/selection) are visibly labeled."""
-    ws = tmp_path / "ws_label"
-    ws.mkdir()
 
     runner_py = _write_runner(tmp_path, """
 import sys,json
@@ -704,7 +956,7 @@ print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
         {"id": "sel", "type": "selection", "prompt": "test", "must_select_skill": "analyze"},
         {"id": "func", "type": "functionality", "prompt": "test", "must_include": ["OK"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
 
     disc = [r for r in suite["cases"] if r["case"] == "disc"][0]
     inv = [r for r in suite["cases"] if r["case"] == "inv"][0]
@@ -721,8 +973,6 @@ print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
 
 def test_verification_class_labeling(tmp_path):
     """verification_class distinguishes measured-diff vs runner-asserted-only vs mixed."""
-    ws = tmp_path / "ws_vclass"
-    ws.mkdir()
 
     runner_py = _write_runner(tmp_path, """
 import sys,json
@@ -735,9 +985,8 @@ print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
         {"id": "disc-only", "type": "discovery", "prompt": "test", "must_match_skill": "x"},
         {"id": "inv-only", "type": "invocation", "prompt": "test", "must_invoke_skill": "analyze"},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
     # All runner-asserted → runner-asserted-only
-    # (functionality with workspace diff gets measured, but we only have non-functionality)
     assert suite["verification_class"] == "runner-asserted-only"
 
 
@@ -820,8 +1069,6 @@ def test_baseline_load_nonexistent(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_type_rollups(tmp_path):
-    ws = tmp_path / "ws_roll"
-    ws.mkdir()
 
     runner_py = _write_runner(tmp_path, """
 import sys,json
@@ -834,7 +1081,7 @@ print(json.dumps({"response":"OK","tool_calls":["analyze"]}))
         {"id": "i1", "type": "invocation", "prompt": "test", "must_invoke_skill": "analyze"},
         {"id": "f1", "type": "functionality", "prompt": "test", "must_include": ["OK"]},
     ])
-    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1, workspace=str(ws))
+    suite = run_behavioral_suite(load_cases(cases), runner_cfg, 1)
 
     types = suite["types"]
     assert "discovery" in types

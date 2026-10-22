@@ -13,7 +13,6 @@ real harness discovery/invocation are not inferred from test output alone.
 from __future__ import annotations
 import json
 import math
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -55,7 +54,7 @@ def load_cases(path):
       - must_match_skill / must_invoke_skill / must_select_skill / must_not_invoke_skill / must_not_select_skill
       - required_artifacts  – list of path prefixes or dicts {path, must_contain, content_digest}
       - forbidden_artifacts – list of path prefixes that must not appear in workspace diff
-      - allowed_diff_prefix – allowed path prefixes for workspace diffs
+      - allowed_diff_prefix – allowed path prefixes for workspace diffs (empty list = no changes)
       - baseline_key        – key used to look up the baseline result for regression cases
     """
     rows = []
@@ -87,8 +86,11 @@ def load_cases(path):
 # Runner config validation
 # ---------------------------------------------------------------------------
 
-def _validate_runner_config(runner, cwd):
-    """Validate a runner config dict (from JSON)."""
+def _validate_runner_config(runner, cwd_hint):
+    """Validate a runner config dict (from JSON).
+
+    Returns (resolved_cwd, timeout_seconds).
+    """
     if not isinstance(runner, dict) or not isinstance(runner.get("argv"), list) or not all(
         isinstance(x, str) and x for x in runner["argv"]):
         raise UniSkillError("Runner config must contain argv: string[]")
@@ -106,6 +108,28 @@ def _validate_runner_config(runner, cwd):
     if not isinstance(reps, int) or not 1 <= reps <= 20:
         raise UniSkillError("Repetitions must be 1-20")
     return resolved_cwd, timeout
+
+
+def _resolve_workspace(workspace, runner_cwd):
+    """Resolve workspace to the single measured tree.
+
+    If workspace is None, returns the runner's cwd.
+    If workspace is supplied and resolves to a different directory than
+    runner_cwd, raises UniSkillError (we never silently compare two trees).
+    """
+    if workspace is None:
+        return runner_cwd
+    ws = Path(workspace).resolve()
+    if not ws.exists():
+        raise UniSkillError(f"Workspace does not exist: {ws}")
+    if not ws.is_dir():
+        raise UniSkillError(f"Workspace is not a directory: {ws}")
+    if ws != runner_cwd:
+        raise UniSkillError(
+            f"Workspace ({ws}) and runner cwd ({runner_cwd}) resolve to "
+            "different directories. Use a single tree for measurement."
+        )
+    return ws
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +259,15 @@ def run_evals(cases, runner_path, repetitions=1):
 # Core behavioral evaluation
 # ---------------------------------------------------------------------------
 
-def _eval_discovery(case, runner_output, measured, workspace_diff):
+def _eval_discovery(case, runner_output, workspace_diff,
+                    measured_tree, timed_out, actual_exit_code,
+                    measured_problems):
     """Evaluate a *discovery* case.
 
-    Returns (state, problems, evidence_type, evidence_detail).
+    *measured_problems* is a list that will be extended with per-type problems.
+    Returns (state, evidence_type, evidence_detail).
     """
-    problems = []
+    problems = list(measured_problems) if measured_problems else []
     evidence_type = RUNNER_ASSERTED
     evidence_detail = {}
 
@@ -248,7 +275,7 @@ def _eval_discovery(case, runner_output, measured, workspace_diff):
     # (no probe harness in the generic runner protocol)
     response_text = (runner_output or "").lower()
 
-    # Positive discovery: must_include_skill asserts the skill was surfaced
+    # Positive discovery: must_match_skill asserts the skill was surfaced
     must_match = case.get("must_match_skill")
     if must_match:
         skill_slug = must_match.lower()
@@ -274,12 +301,14 @@ def _eval_discovery(case, runner_output, measured, workspace_diff):
     return FAILED, problems, evidence_type, evidence_detail
 
 
-def _eval_invocation(case, runner_output, tool_calls, measured, workspace_diff):
+def _eval_invocation(case, runner_output, tool_calls, workspace_diff,
+                     measured_tree, timed_out, actual_exit_code,
+                     measured_problems):
     """Evaluate an *invocation* (explicit invocation) case.
 
-    Returns (state, problems, evidence_type, evidence_detail).
+    Returns (state, evidence_type, evidence_detail).
     """
-    problems = []
+    problems = list(measured_problems) if measured_problems else []
     evidence_type = RUNNER_ASSERTED
     evidence_detail = {}
 
@@ -303,27 +332,22 @@ def _eval_invocation(case, runner_output, tool_calls, measured, workspace_diff):
         if must_not_invoke in actual_tools:
             problems.append(f"Tool '{must_not_invoke}' was called but must_not_invoke_skill")
 
-    # Without measured tool-events, this is runner-asserted
     if not problems:
         evidence_detail = {
             "reason": "Tool calls from runner self-report; no measured tool-events",
         }
 
-    if not problems:
-        # All invocations as asserted — still PASS but note it
-        pass
     return (FAILED if problems else PASS), problems, evidence_type, evidence_detail
 
 
-def _eval_selection(case, runner_output, tool_calls, measured, workspace_diff):
+def _eval_selection(case, runner_output, tool_calls, workspace_diff,
+                    measured_tree, timed_out, actual_exit_code,
+                    measured_problems):
     """Evaluate a *selection* (automatic/auto-trigger) case.
 
-    Selection cases assert that a skill was *automatically* selected (positive)
-    or *not* selected (negative) for a given prompt.
-
-    Returns (state, problems, evidence_type, evidence_detail).
+    Returns (state, evidence_type, evidence_detail).
     """
-    problems = []
+    problems = list(measured_problems) if measured_problems else []
     evidence_type = RUNNER_ASSERTED
     evidence_detail = {}
 
@@ -358,29 +382,85 @@ def _eval_selection(case, runner_output, tool_calls, measured, workspace_diff):
     return (FAILED if problems else PASS), problems, evidence_type, evidence_detail
 
 
-def _eval_functionality(case, runner_output, tool_calls, measured, workspace_diff):
+def _check_artifact_content(artifact_path, measured_tree, must_contain,
+                            content_digest):
+    """Check file content in the measured tree.
+
+    Returns a list of problem strings (empty if all checks pass).
+    """
+    problems = []
+    if not measured_tree:
+        problems.append(
+            f"Cannot check content of {artifact_path}: measured tree unavailable"
+        )
+        return problems
+
+    fpath = measured_tree / artifact_path
+    if not fpath.exists():
+        problems.append(f"Cannot check content of {artifact_path}: file not in measured tree")
+        return problems
+
+    content = fpath.read_text(encoding="utf-8")
+
+    # Check must_contain (substring)
+    if must_contain is not None:
+        for substring in must_contain if isinstance(must_contain, list) else [must_contain]:
+            if substring not in content:
+                problems.append(
+                    f"Artifact {artifact_path} missing required content: {substring}"
+                )
+
+    # Check content_digest (sha256 hex)
+    if content_digest is not None:
+        actual_digest = hashlib_file(fpath.read_bytes())
+        if actual_digest != content_digest:
+            problems.append(
+                f"Artifact {artifact_path} content-digest mismatch: "
+                f"expected {content_digest}, got {actual_digest}"
+            )
+
+    return problems
+
+
+def _eval_functionality(case, runner_output, tool_calls, workspace_diff,
+                        measured_tree, timed_out, actual_exit_code,
+                        measured_problems):
     """Evaluate a *functionality* case.
 
     Uses measured workspace diff + runner output assertions.
     Workspace diff is the primary evidence — not runner prose.
 
-    Returns (state, problems, evidence_type, evidence_detail).
+    Returns (state, evidence_type, evidence_detail).
     """
-    problems = []
+    problems = list(measured_problems) if measured_problems else []
 
     # 1. Workspace diff checks — MEASURED evidence
-    allowed_prefixes = case.get("allowed_diff_prefix", [])
+    allowed_prefixes = case.get("allowed_diff_prefix")
     required_artifacts = case.get("required_artifacts", [])
     forbidden_artifacts = case.get("forbidden_artifacts", [])
 
-    # Check forbidden artifacts: no created/modified path outside allowed prefixes
-    if allowed_prefixes:
-        for path_name in workspace_diff["created"] + workspace_diff["modified"] + workspace_diff["deleted"]:
-            if not any(path_name.startswith(p) for p in allowed_prefixes):
-                problems.append(f"Forbidden side effect: workspace changed outside allowed prefixes: {path_name}")
+    # Check allowed_diff_prefix: empty list means "no changes allowed at all"
+    if allowed_prefixes is not None:
+        all_changes = (
+            workspace_diff["created"] + workspace_diff["modified"] + workspace_diff["deleted"]
+        )
+        for path_name in all_changes:
+            if allowed_prefixes:
+                # Non-empty list: path must start with one of the prefixes
+                if not any(path_name.startswith(p) for p in allowed_prefixes):
+                    problems.append(
+                        f"Forbidden side effect: workspace changed outside "
+                        f"allowed prefixes: {path_name}"
+                    )
+                    break
+            else:
+                # Empty list = nothing is allowed to change
+                problems.append(
+                    f"Forbidden side effect: workspace changed (empty allowed_diff_prefix): {path_name}"
+                )
                 break
 
-    # Check required artifacts against actual diff
+    # 2. Check required artifacts against actual diff
     for artifact in required_artifacts:
         if isinstance(artifact, str):
             # Just a path prefix to check was created or modified
@@ -397,30 +477,39 @@ def _eval_functionality(case, runner_output, tool_calls, measured, workspace_dif
                 problems.append(
                     f"Missing required artifact: {artifact_path} (not in workspace diff)"
                 )
-            # Check must_contain content
-            mc = artifact.get("must_contain")
-            if mc and (created or modified):
-                # We need the file content — try reading it if it exists
-                fpath = measured.get(artifact_path)
-                if fpath is None:
-                    # File was created/modified, try to read from workspace
-                    pass  # content check requires the actual file
+            else:
+                # File exists in diff — check must_contain / content_digest
+                mc = artifact.get("must_contain")
+                cd = artifact.get("content_digest")
+                if mc is not None or cd is not None:
+                    content_problems = _check_artifact_content(
+                        artifact_path, measured_tree, mc, cd
+                    )
+                    problems.extend(content_problems)
 
-    # Check forbidden artifact paths actually don't appear in diff
-    for fpath in forbidden_artifacts:
-        if isinstance(fpath, str):
+    # 3. Check forbidden artifact paths against diff
+    for fpath_str in forbidden_artifacts:
+        if isinstance(fpath_str, str):
             for change_path in workspace_diff["created"] + workspace_diff["modified"] + workspace_diff["deleted"]:
-                if change_path.startswith(fpath):
+                # Check relative diff path against the forbidden prefix
+                if change_path.startswith(fpath_str):
                     problems.append(f"Forbidden artifact created/changed: {change_path}")
                     break
-        elif isinstance(fpath, dict):
-            fp = fpath.get("path", "")
+                # Also check the workspace-absolute resolution of the diff path
+                abs_change = fpath_str + change_path
+                if abs_change == change_path:
+                    continue  # already checked relative path above
+                if abs_change.startswith(fpath_str):
+                    problems.append(f"Forbidden artifact created/changed (absolute match): {change_path}")
+                    break
+        elif isinstance(fpath_str, dict):
+            fp = fpath_str.get("path", "")
             for change_path in workspace_diff["created"] + workspace_diff["modified"] + workspace_diff["deleted"]:
                 if change_path == fp:
                     problems.append(f"Forbidden artifact path changed: {fp}")
                     break
 
-    # 2. Text-based assertions (backward compat) — runner-asserted
+    # 4. Text-based assertions (backward compat) — runner-asserted
     response_text = runner_output or ""
     for pattern in case.get("must_include", []):
         if not re.search(pattern, response_text, flags=re.IGNORECASE | re.MULTILINE):
@@ -429,7 +518,7 @@ def _eval_functionality(case, runner_output, tool_calls, measured, workspace_dif
         if re.search(pattern, response_text, flags=re.IGNORECASE | re.MULTILINE):
             problems.append(f"Forbidden match: {pattern}")
 
-    # 3. Tool trace assertions — runner-asserted
+    # 5. Tool trace assertions — runner-asserted
     required_tools = case.get("required_tools", [])
     forbidden_tools = case.get("forbidden_tools", [])
     if required_tools or forbidden_tools:
@@ -447,23 +536,27 @@ def _eval_functionality(case, runner_output, tool_calls, measured, workspace_dif
                 f"Forbidden tool used: {t}" for t in forbidden_tools if t in actual
             ]
 
-    # Exit code
+    # 6. Exit code check — measured evidence
+    # actual_exit_code is threaded from _run_single_case (not from case dict)
     expected_exit = case.get("expected_exit_code")
-    if expected_exit is not None and case.get("actual_exit_code") != expected_exit:
+    if expected_exit is not None and actual_exit_code != expected_exit:
         problems.append(
-            f"Unexpected exit code: {case.get('actual_exit_code', 'N/A')} "
+            f"Unexpected exit code: {actual_exit_code} "
             f"(expected {expected_exit})"
         )
 
-    # Determine evidence type for label
-    has_measured_diff = bool(workspace_diff.get("created") or workspace_diff.get("modified") or workspace_diff.get("deleted"))
-    evidence_type = MEASURED if has_measured_diff else RUNNER_ASSERTED
+    # Determine evidence type: if measured_tree was available and snapshot
+    # didn't fail, we have measured evidence (even if diff has no changes).
+    # If measured_tree is None, we have no measurement.
+    has_measured_diff = bool(
+        workspace_diff.get("created") or workspace_diff.get("modified")
+        or workspace_diff.get("deleted")
+    )
+    if measured_tree is not None:
+        evidence_type = MEASURED
+    else:
+        evidence_type = MEASURED  # snapshot was taken, diff is empty but measured
 
-    # Even if diff has no changes, measured snapshot was taken
-    # so we still classify as measured
-    evidence_type = MEASURED
-
-    # Build evidence detail
     evidence_detail = {
         "workspace_diff": workspace_diff,
         "has_measured_diff": has_measured_diff,
@@ -472,36 +565,31 @@ def _eval_functionality(case, runner_output, tool_calls, measured, workspace_dif
     return (FAILED if problems else PASS), problems, evidence_type, evidence_detail
 
 
-def _eval_regression(case, runner_output, tool_calls, measured, workspace_diff,
-                     baseline_results, case_id):
+def _eval_regression(case, runner_output, tool_calls, workspace_diff,
+                     measured_tree, timed_out, actual_exit_code,
+                     baseline_results, case_id, measured_problems):
     """Evaluate a *regression* case by comparing against a stored baseline.
 
-    Returns (state, problems, evidence_type, evidence_detail).
+    Returns (state, evidence_type, evidence_detail).
     """
-    problems = []
-    evidence_type = MEASURED
-    evidence_detail = {}
+    # Start with measured problems (exit code, etc.) from subprocess
+    problems = list(measured_problems) if measured_problems else []
 
     # Find baseline for this case
     baseline_key = case.get("baseline_key", case_id)
     baseline = baseline_results.get(baseline_key)
 
     if baseline is None:
-        # No baseline exists — this is not a regression, treat as normal functionality
-        # But regression cases MUST have a baseline; if none exists, we can't evaluate
         return UNVERIFIED, ["No baseline found for case; cannot evaluate regression"], MEASURED, {}
 
     baseline_state = baseline.get("state")
     baseline_problems = baseline.get("problems", [])
 
-    # Current run result
+    # Re-run basic assertions on the current run to get current problems
     current_problems = []
     current_response = runner_output or ""
     current_tool_calls = tool_calls
-    current_exit = case.get("actual_exit_code")
-    current_exit_expected = case.get("expected_exit_code")
 
-    # Re-run basic assertions on the current run to get problems
     response_text = current_response or ""
     for pattern in case.get("must_include", []):
         if not re.search(pattern, response_text, flags=re.IGNORECASE | re.MULTILINE):
@@ -525,10 +613,16 @@ def _eval_regression(case, runner_output, tool_calls, measured, workspace_diff,
             current_problems += [
                 f"Forbidden tool used: {t}" for t in forb_tools if t in actual
             ]
-    if current_exit_expected is not None and current_exit != current_exit_expected:
+    # Exit code check — measured
+    current_exit_expected = case.get("expected_exit_code")
+    if current_exit_expected is not None and actual_exit_code != current_exit_expected:
         current_problems.append(
-            f"Unexpected exit code: {current_exit} (expected {current_exit_expected})"
+            f"Unexpected exit code: {actual_exit_code} (expected {current_exit_expected})"
         )
+
+    # Merge measured problems (exit code, timeout, schema) into current_problems
+    if measured_problems:
+        current_problems.extend(measured_problems)
 
     current_pass = len(current_problems) == 0
     baseline_pass = len(baseline_problems) == 0
@@ -574,11 +668,12 @@ def reliability(rows):
 
     Returns a dict:
       {case_id: {"trials": N, "passes": P, "pass_rate": P/N,
-                 "verdict": "PASS"|"FAIL"|"FLAKY"|"TOO_FEW",
+                 "verdict": "PASS"|"FAIL"|"FLAKY"|"TOO_FEW"|"TIMEOUT",
                  "confidence": "..." }}
 
     A case with < 5 trials gets an honest "too few" statement.
     A case that passes in some trials and fails in others is FLAKY.
+    TIMEOUT is its own state — all-TIMEOUT is NOT FAIL.
     """
     # Group by case
     cases = {}
@@ -601,37 +696,44 @@ def reliability(rows):
             )
         else:
             states = {t["state"] for t in trials}
-            # FLAKY = passed in some, failed in others (excluding UNVERIFIED/TIMEOUT)
-            evaluated_states = {s for s in states if s not in (UNVERIFIED,)}
-            if len(evaluated_states) > 1 or (
-                len(evaluated_states) == 1 and FAILED in evaluated_states
-            ):
-                # Check if it's actually mixed
-                has_pass = PASS in states
-                has_fail = any(t["state"] in (FAILED, REGRESSION) for t in trials)
-                if has_pass and has_fail:
-                    verdict = "FLAKY"
-                    confidence = (
-                        f"Passed {passes}/{n} trials — UNRELIABLE/flaky behavior detected"
-                    )
-                elif not has_pass:
-                    verdict = "FAIL"
-                    confidence = (
-                        f"Failed in all {n} trials"
-                    )
+            all_timeouts = all(t["state"] == TIMEOUT for t in trials)
+            if all_timeouts:
+                verdict = "TIMEOUT"
+                confidence = (
+                    f"All {n} trials timed out; no evaluation possible"
+                )
+            else:
+                # FLAKY = passed in some, failed in others (excluding UNVERIFIED/TIMEOUT)
+                evaluated_states = {s for s in states if s not in (UNVERIFIED, TIMEOUT)}
+                if len(evaluated_states) > 1 or (
+                    len(evaluated_states) == 1 and FAILED in evaluated_states
+                ):
+                    # Check if it's actually mixed
+                    has_pass = PASS in states
+                    has_fail = any(t["state"] in (FAILED, REGRESSION) for t in trials)
+                    if has_pass and has_fail:
+                        verdict = "FLAKY"
+                        confidence = (
+                            f"Passed {passes}/{n} trials — UNRELIABLE/flaky behavior detected"
+                        )
+                    elif not has_pass:
+                        verdict = "FAIL"
+                        confidence = (
+                            f"Failed in all {n} trials"
+                        )
+                    else:
+                        verdict = "PASS"
+                        # Binomial 95% Wilson interval
+                        lo, hi = _wilson_interval(passes, n)
+                        confidence = (
+                            f"Passed all {n} trials; 95% Wilson CI: [{lo:.3f}, {hi:.3f}]"
+                        )
                 else:
                     verdict = "PASS"
-                    # Binomial 95% Wilson interval
                     lo, hi = _wilson_interval(passes, n)
                     confidence = (
                         f"Passed all {n} trials; 95% Wilson CI: [{lo:.3f}, {hi:.3f}]"
                     )
-            else:
-                verdict = "PASS"
-                lo, hi = _wilson_interval(passes, n)
-                confidence = (
-                    f"Passed all {n} trials; 95% Wilson CI: [{lo:.3f}, {hi:.3f}]"
-                )
 
         result[cid] = {
             "trials": n,
@@ -697,7 +799,9 @@ def run_behavioral_suite(cases, runner_path, repetitions=1, workspace=None,
         Number of repetitions per case. Default 1.
     workspace : str | Path, optional
         Workspace directory to snapshot before and diff after the run.
-        If provided, functionality cases get measured workspace diffs.
+        If provided, it MUST resolve to the same directory as the runner's cwd,
+        or else UniSkillError is raised (we never silently measure two trees).
+        If None, the runner's cwd is used as the measured tree.
     baseline_path : str | Path, optional
         Path to a baseline JSON file for regression comparison.
 
@@ -712,19 +816,18 @@ def run_behavioral_suite(cases, runner_path, repetitions=1, workspace=None,
     """
     # Load runner config
     runner = read_json(runner_path)
-    cwd, timeout = _validate_runner_config(runner, str(workspace or "."))
+    runner_cwd, timeout = _validate_runner_config(runner, str(workspace or "."))
+
+    # Resolve to a single measured tree
+    measured_tree = _resolve_workspace(workspace, runner_cwd)
 
     # Load baseline if provided
     baseline_data = {}
     if baseline_path:
         baseline_data = baseline_load(baseline_path)
 
-    # Snapshot workspace before (measured evidence)
-    workspace_before = None
-    if workspace:
-        ws = Path(workspace)
-        if ws.exists() and ws.is_dir():
-            workspace_before = snapshot_workspace(ws)
+    # Snapshot workspace before (measured evidence) — single tree
+    workspace_before = snapshot_workspace(measured_tree)
 
     # Execute each case for each repetition
     all_rows = []
@@ -735,7 +838,7 @@ def run_behavioral_suite(cases, runner_path, repetitions=1, workspace=None,
         case_type = case.get("type", "functionality")
 
         for repeat in range(repetitions):
-            row = _run_single_case(case, case_id, runner, cwd, timeout,
+            row = _run_single_case(case, case_id, runner, measured_tree, timeout,
                                    workspace_before, repeat + 1, baseline_data)
             all_rows.append(row)
 
@@ -812,9 +915,13 @@ def run_behavioral_suite(cases, runner_path, repetitions=1, workspace=None,
     }
 
 
-def _run_single_case(case, case_id, runner, cwd, timeout,
+def _run_single_case(case, case_id, runner, measured_tree, timeout,
                      workspace_before, repeat, baseline_data):
-    """Execute a single case+repeat and return a row dict."""
+    """Execute a single case+repeat and return a row dict.
+
+    *measured_tree* is the single resolved directory to snapshot before/after.
+    All measured evidence comes from THIS tree only.
+    """
     case_type = case.get("type", "functionality")
     problems = []
     runner_output = None
@@ -824,12 +931,13 @@ def _run_single_case(case, case_id, runner, cwd, timeout,
 
     try:
         proc = subprocess.run(
-            runner["argv"], cwd=cwd, input=case["prompt"],
+            runner["argv"], cwd=measured_tree, input=case["prompt"],
             capture_output=True, text=True, timeout=timeout, check=False,
         )
         stdout = proc.stdout[-100000:]
         actual_exit_code = proc.returncode
 
+        # Record exit-code problem early (it threads through to per-type eval)
         if proc.returncode != case.get("expected_exit_code", 0):
             problems.append(f"Unexpected exit code: {proc.returncode}")
 
@@ -851,45 +959,51 @@ def _run_single_case(case, case_id, runner, cwd, timeout,
         actual_exit_code = None
         problems.append("Runner timed out")
 
-    # Snapshot workspace after (if measured)
+    # Snapshot workspace after — SAME measured tree, NOT runner.get("cwd")
     workspace_after = None
     workspace_diff = {"created": [], "modified": [], "deleted": []}
-    if workspace_before is not None:
-        try:
-            ws = Path(
-                runner.get("cwd", ".")
-            )
-            if ws.exists() and ws.is_dir():
-                workspace_after = snapshot_workspace(ws)
-                workspace_diff = diff_workspace(workspace_before, workspace_after)
-        except Exception:
-            pass
+    try:
+        workspace_after = snapshot_workspace(measured_tree)
+        workspace_diff = diff_workspace(workspace_before, workspace_after)
+    except Exception as exc:
+        # Snapshot failure must FAIL — never silently return empty diff
+        problems.append(f"Snapshot failure: {exc}")
 
-    # Evaluate based on type
+    # Evaluate based on type, threading measured_problems through
     eval_state = PASS
     evidence_type = MEASURED
     evidence_detail = {}
 
     if case_type == "discovery":
         eval_state, problems, evidence_type, evidence_detail = _eval_discovery(
-            case, runner_output, workspace_after, workspace_diff
+            case, runner_output, workspace_diff,
+            measured_tree, timed_out, actual_exit_code,
+            problems if problems else None,
         )
     elif case_type == "invocation":
         eval_state, problems, evidence_type, evidence_detail = _eval_invocation(
-            case, runner_output, tool_calls, workspace_after, workspace_diff
+            case, runner_output, tool_calls, workspace_diff,
+            measured_tree, timed_out, actual_exit_code,
+            problems if problems else None,
         )
     elif case_type == "selection":
         eval_state, problems, evidence_type, evidence_detail = _eval_selection(
-            case, runner_output, tool_calls, workspace_after, workspace_diff
+            case, runner_output, tool_calls, workspace_diff,
+            measured_tree, timed_out, actual_exit_code,
+            problems if problems else None,
         )
     elif case_type == "regression":
         eval_state, problems, evidence_type, evidence_detail = _eval_regression(
-            case, runner_output, tool_calls, workspace_after, workspace_diff,
-            baseline_data, case_id
+            case, runner_output, tool_calls, workspace_diff,
+            measured_tree, timed_out, actual_exit_code,
+            baseline_data, case_id,
+            problems if problems else None,
         )
     else:  # functionality (default)
         eval_state, problems, evidence_type, evidence_detail = _eval_functionality(
-            case, runner_output, tool_calls, workspace_after, workspace_diff
+            case, runner_output, tool_calls, workspace_diff,
+            measured_tree, timed_out, actual_exit_code,
+            problems if problems else None,
         )
 
     # Handle timeout as its own state
@@ -899,10 +1013,11 @@ def _run_single_case(case, case_id, runner, cwd, timeout,
         if "Runner timed out" not in problems:
             problems.append("Runner timed out")
 
-    # For non-functionality types, run backward-compat assertions (old case
-    # files that declare "discovery"/"invocation"/"selection" but still carry
-    # must_include / must_not_include / required_tools / forbidden_tools).
-    if case_type != "functionality" and case_type != "regression" and not timed_out:
+    # For non-functionality, non-regression types: run backward-compat
+    # assertions (old case files that declare "discovery"/"invocation"/"selection"
+    # but still carry must_include / must_not_include / required_tools /
+    # forbidden_tools).
+    if case_type not in ("functionality", "regression") and not timed_out:
         for pattern in case.get("must_include", []):
             if not re.search(pattern, runner_output or "", flags=re.IGNORECASE | re.MULTILINE):
                 problems.append(f"Missing match: {pattern}")

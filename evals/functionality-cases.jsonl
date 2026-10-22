@@ -1,2 +1,2 @@
 {"id":"func-artifact","type":"functionality","prompt":"Generate a SKILL.md for concurrency auditing.","required_artifacts":["output/skill.md"],"allowed_diff_prefix":["output/"]}
-{"id":"func-no-side-effect","type":"functionality","prompt":"Audit the backend for concurrency bottlenecks.","forbidden_artifacts":["/etc/","/root/"],"allowed_diff_prefix":[]}
+{"id":"func-no-side-effect","type":"functionality","prompt":"Audit the backend for concurrency bottlenecks.","forbidden_artifacts":["forbidden_"],"allowed_diff_prefix":[]}

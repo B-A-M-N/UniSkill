@@ -9,7 +9,7 @@ from .contract import generate_skill, load_contract
 from .deploy import (install, latest_receipt, plan, read_receipt, rollback,
                      state_root, verify_receipt)
 from .deploy import plan as deployment_plan
-from .evaluation import load_cases, run_evals
+from .evaluation import load_cases, run_behavioral_suite
 from .harnesses import (HARNESSES, capability_profile, detect, load_registry,
                         native_discovery, opencode_diagnostics, crush_diagnostics, inspect_harness_skill)
 from .validator import validate_skill
@@ -61,6 +61,12 @@ def build_parser():
     evaluation.add_argument("--runner-config", type=Path, required=True)
     evaluation.add_argument("--execute", action="store_true", help="Required to run subprocesses")
     evaluation.add_argument("--repetitions", type=int, default=1)
+    evaluation.add_argument("--workspace", type=Path,
+                            help="Measured tree for workspace-diff evidence; must be the "
+                                 "runner's cwd. Defaults to the runner's configured cwd.")
+    evaluation.add_argument("--baseline", type=Path,
+                            help="Baseline JSON for regression-type cases "
+                                 "(see baselines_save)")
     capabilities = commands.add_parser("capabilities")
     capabilities.add_argument("harness")
     diagnose = commands.add_parser("diagnose",
@@ -328,7 +334,13 @@ def dispatch(args):
         if not args.execute:
             return {"state":"UNVERIFIED", "cases":len(cases),
                     "note":"No subprocesses executed; use --execute to approve runner"}
-        return run_evals(cases, args.runner_config, args.repetitions)
+        # Behavioral suite: measured workspace-diff evidence, four test types,
+        # reliability over repetitions. The runner is trusted and explicitly
+        # configured, but its self-report is only ever labeled evidence, not
+        # proof — artifacts are measured against the actual workspace diff.
+        return run_behavioral_suite(cases, args.runner_config, args.repetitions,
+                                    workspace=args.workspace,
+                                    baseline_path=args.baseline)
     raise UniSkillError("Unknown command")
 
 def main(argv=None):

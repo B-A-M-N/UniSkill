@@ -163,8 +163,11 @@ One successful response is not proof. Per-case reliability is computed over `--r
 
 ```bash
 uniskill evaluate evals/functionality-cases.jsonl \
-  --runner-config examples/runner.json --repetitions 3 --execute
+  --runner-config examples/runner.json --repetitions 3 --execute \
+  --workspace /path/to/measured/tree --baseline evals/baselines/my-skill.json
 ```
+
+`--workspace` names the measured tree for snapshot-diff evidence; it must be the runner's working directory (the evaluator refuses to silently diff two different trees). `--baseline` enables regression comparison for `regression`-type cases.
 
 The included `echo_runner.py` is a fixture, **not** a real agent execution backend. Its passing assertions prove that the evaluation machinery works, not that a particular skill works. Execution can run arbitrary trusted local binaries, so it must be requested with `--execute`; do not point it at untrusted scripts. The evaluator only ever launches the explicitly configured runner — it never executes anything implicitly.
 
